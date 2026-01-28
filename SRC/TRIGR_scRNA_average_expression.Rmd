@@ -1,0 +1,128 @@
+---
+title: "TRIGR_scRNA_average_expression"
+output: html_document
+---
+
+```{r setup}
+
+library(dplyr)
+library(Seurat)
+library(Signac)
+library(sctransform)
+library(future)
+library(ggplot2)
+library(readr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(GenomicRanges)
+library(EnsDb.Hsapiens.v86)
+library(GenomeInfoDb)
+library(SingleCellExperiment)
+library(ExperimentHub)
+library(celldex)
+library(SeuratDisk)
+library(glmGamPoi)
+library(future)
+library(SingleR)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+
+# scRNA seurat object location
+seurat_dir <- ".../TRIGR_scRNA_so_prep"
+# scRNA seurat cell type object location
+seurat_cells_dir <- ".../TRIGR_scRNA_cell_type_projection"
+
+# Top level output dir
+project_dir <- "..."
+# subanalysis output directory
+subanalysis_name <- "TRIGR_scRNA_average_expression"
+
+options(future.globals.maxSize=100*1e9)
+
+# Output folder for this document
+options(knitr.figure_dir = paste0(
+  project_dir, "/",
+  subanalysis_name
+  )
+)
+
+source("knitr_common.r")
+```
+
+``` {r load_data}
+so <- faster_readRDS(
+  paste(
+    seurat_dir,
+    "so_integrated.rds",
+    sep = "/"
+  )
+)
+
+so@meta.data <- faster_readRDS(
+  paste(
+    seurat_dir,
+    "metadata.rds",
+    sep = "/"
+  )
+)
+
+so@commands <- faster_readRDS(
+  paste(
+    seurat_dir,
+    "commands.rds",
+    sep = "/"
+  )
+)
+
+so@reductions$umap <- faster_readRDS(
+  paste(
+    seurat_dir,
+    "umap_reduction.rds",
+    sep = "/"
+  )
+)
+
+so@reductions$CITE_seq_umap <- faster_readRDS(
+  paste(
+    seurat_dir,
+    "CITE_seq_umap_reduction.rds",
+    sep = "/"
+  )
+)
+
+so$CellType <- faster_readRDS(
+  paste(
+    seurat_cells_dir,
+    "so_RNA_projected_cell_labels.rds",
+    sep = "/"
+  )
+)
+```
+
+``` {r get_average_expression}
+
+so$CellType_by_TP <- paste(so$CellType, "TP", so$timepoint, sep = "_")
+
+averages_cell_by_tp <- AverageExpression(so, assays = "SCT", group.by = "CellType_by_TP")
+averages_cell_type <- AverageExpression(so, assays = "SCT", group.by = "CellType")
+averages_overall <- AverageExpression(so, assays = "SCT", group.by = "orig.ident")
+```
+
+``` {r save_results}
+faster_saveRDS(
+  averages_cell_by_tp$SCT,
+  file = paste0(figure_path(), "average_exp_by_cell_by_tp.rds")
+)
+faster_saveRDS(
+  averages_cell_type$SCT,
+  file = paste0(figure_path(), "average_exp_by_cell.rds")
+)
+faster_saveRDS(
+  averages_overall$SCT,
+  file = paste0(figure_path(), "average_exp_overall.rds")
+)
+```
+
+
+

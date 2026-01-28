@@ -1,0 +1,67 @@
+#### Source Code for TRIGR paper ###
+
+Note that the code is provided as-is, and is meant to be used to demonstrate the methods used to perform tertiary analysis on the sequencing data which is archived on EGA as described in the TRIGR paper. 
+
+Before running the code,  initial sample processing using cellranger and cellranger aggr as appropriate will be needed to generate the files data files needed by Seurat and Signac for the initial data preparation stages.
+
+YOU WILL NEED TO ADJUST THE SOURCE CODE TO REFLECT THE LOCATIONS OF THE INPUT FILES AND THE OUTPUT FILES FOR YOUR FILESYSTEM.  You will also likely need to install the Seurat and Signac libraries and their dependencies.
+
+https://satijalab.org/seurat/
+https://stuartlab.org/signac/
+
+Genotype demultiplexing of the cell barcodes was done using popscle implementation of demuxlet
+
+https://github.com/statgen/popscle
+
+### Contents:
+## SRC/ : Source code directory
+
+# utility
+SRC/knitr_common.r : shared Rmarkdown setup script
+
+# Initial data preparation (create Seurat objects)
+SRC/demuxlet.atac.trigr.b38.sh : example code to regenerate scATAC demultiplexing results
+SRC/TRIGR_scATAC_so_prep.Rmd : seurat object prep for single cell ATAC
+SRC/TRIGR_scMulti_so_prep.Rmd : seurat object prep for single cell multiome
+SRC/TRIGR_scRNA_so_prep.Rmd : seurat object prep for single cell RNA
+
+SRC/TRIGR_scATAC_cell_type_curation.Rmd : cell type for scATAC
+SRC/TRIGR_scMulti_cell_type_curation.Rmd : cell type for multiome
+SRC/TRIGR_scRNA_cell_type_projection.Rmd : cell type for scRNA
+
+# merge the ATAC from multiome with scATAC
+SRC/TRIGR_scATAC_macs2_peaks_from_scMulti_quantification.Rmd : use multiome peaks for scATAC
+SRC/TRIGR_scATAC_scMulti_merging.Rmd : merged ATAC prep (and celltypes)
+
+# Extract average RNA expression and ATAC accessibility
+SRC/TRIGR_scRNA_average_expression.Rmd : average expression scRNA
+SRC/TRIGR_scATAC_average_accessibility.Rmd : average accessibility scATAC
+
+# examples of analyses described in methods
+SRC/TRIGR_scRNA_scATAC_link_correlation.Rmd : scRNA to scATAC correlation
+SRC/TRIGR_scRNA.diff_oe_new_groups.R : example of observed/expected analysis on scRNA
+SRC/TRIGR_mergedCells_OE_new_groups.R : example of observed/expected analysis for multiome and merged ATAC datasets
+
+## DATA/ : Supporting Data files
+DATA/blood_peaks.rds : reference ATAC peaks from blood cells
+DATA/demuxlet.atac.trigr.b38.sh : example code to generate scATAC demultiplexing results
+DATA/multiome_libraries.csv : list of the multiome libraries
+DATA/TRIGR_scRNA_cell_types.tomi.tsv : mapping of predicted cell types to merged cell types for scRNA
+DATA/lymphoid_DHS.bed : lymphoid cell DHS sites
+DATA/myeloid_erythroid_DHS.bed : myeloid and erythroid cell DHS sites
+DATA/gencode.v32.annotation.genes.bed : genes from gencode v32 (for scRNA analysis)
+DATA/gencode.v38.annotation.genes.bed : genes from gencode v38 (for multiome and merged ATAC analysis)
+
+# Download cite-seq multimodal reference data to DATA/ from:
+https://atlas.fredhutch.org/data/nygc/multimodal/pbmc_multimodal.h5seurat
+
+# Data files containing PHI that must be requested via EGA (these are expected to be in the DATA/ directory).  These are in the archive trigr-sample-info.zip
+HLA_assignments.xlsx
+TRIGR_2024_new_groups.filtered.geno.tsv
+TRIGR_2024_new_groups.filtered.tsv
+calendar_age_TRIGR.csv
+sample_info.csv
+sample_info_multiome.csv
+
+### License
+All files are provided as-is and all original code is provided under the terms of the MIT license. 

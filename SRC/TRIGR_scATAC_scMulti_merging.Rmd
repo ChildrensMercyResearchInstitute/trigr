@@ -1,0 +1,274 @@
+---
+title: "TRIGR_scATAC_scMulti_merging"
+output: html_document
+---
+
+```{r setup}
+
+library(dplyr)
+library(Seurat)
+library(Signac)
+library(sctransform)
+library(future)
+library(ggplot2)
+library(readr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(GenomicRanges)
+library(EnsDb.Hsapiens.v86)
+library(GenomeInfoDb)
+library(SingleCellExperiment)
+library(ExperimentHub)
+library(celldex)
+library(SeuratDisk)
+library(glmGamPoi)
+library(future)
+library(SingleR)
+
+# scATAC seurat object location
+seurat_scatac_dir <- ".../TRIGR_scATAC_so_prep"
+# multiome seurat object location
+seurat_scmulti_dir <- ".../TRIGR_scMulti_so_prep"
+
+# multiome cell types
+seurat_scmulti_cells <- ".../TRIGR_scMulti_cell_type_curation"
+# scatac cell types
+seurat_scatac_cells <- ".../TRIGR_scATAC_cell_type_curation"
+
+# scATAC macs2 using multiome peaks
+seurat_scatac_macs2 <- ".../TRIGR_scATAC_macs2_peaks_from_scMulti_quantification"
+
+project_dir <- "..."
+subanalysis_name <- "TRIGR_scATAC_scMulti_merging"
+
+options(
+  future.globals.maxSize=100*1e9
+)
+
+# Output folder for this document
+options(knitr.figure_dir = paste0(
+  project_dir, "/",
+  subanalysis_name
+  )
+)
+
+source("knitr_common.r")
+```
+
+
+``` {r load_scATAC_data}
+so_ATAC <- faster_readRDS(
+  paste(
+    seurat_scatac_dir,
+    "so_scATAC.rds",
+    sep = "/"
+  )
+)
+
+so_ATAC@meta.data <- faster_readRDS(
+  paste(
+    seurat_scatac_dir,
+    "metadata.rds",
+    sep = "/"
+  )
+)
+
+so_ATAC@commands <- faster_readRDS(
+  paste(
+    seurat_scatac_dir,
+    "commands.rds",
+    sep = "/"
+  )
+)
+
+so_ATAC$CellType <- faster_readRDS(
+  paste(
+    seurat_scatac_cells,
+    "cell_labels.rds",
+    sep = "/"
+  )
+)
+
+so_ATAC@assays$macs2Peaks <- faster_readRDS(
+  paste(
+    seurat_scatac_macs2,
+    "scMulti_macs2Peaks_assay.rds",
+    sep = "/"
+  )
+)
+
+```
+
+``` {r load_scMulti_data}
+so_Multi <- faster_readRDS(
+  paste(
+    seurat_scmulti_dir,
+    "so_integrated_no_batch_var.rds",
+    sep = "/"
+  )
+)
+
+so_Multi@meta.data <- faster_readRDS(
+  paste(
+    seurat_scmulti_dir,
+    "metadata.rds",
+    sep = "/"
+  )
+)
+
+so_Multi@commands <- faster_readRDS(
+  paste(
+    seurat_scmulti_dir,
+    "commands.rds",
+    sep = "/"
+  )
+)
+
+so_Multi@assays$macs2Peaks <- faster_readRDS(
+  paste(
+    seurat_scmulti_dir,
+    "macs2_peaks_ATAC_assay_w_links_cluster_run.rds",
+    sep = "/"
+  )
+)
+
+
+so_Multi$CellType <- faster_readRDS(
+  paste(
+    seurat_scmulti_cells,
+    "cell_labels.rds",
+    sep = "/"
+  )
+)
+
+
+```
+
+``` {r subset_data}
+
+DefaultAssay(so_ATAC) <- "macs2Peaks"
+so_ATAC@assays$RNA <- NULL
+so_ATAC@reductions$lsi <- NULL
+so_ATAC@reductions$umap.atac <- NULL
+so_ATAC$assay_type <- "scATAC"
+
+DefaultAssay(so_Multi) <- "macs2Peaks"
+so_Multi@assays$RNA <- NULL
+so_Multi@assays$integratedRNA <- NULL
+so_Multi@assays$SCT <- NULL
+so_Multi@reductions$lsi <- NULL
+so_Multi@reductions$integratedPCA <- NULL
+
+```
+
+``` {r transfer_cell_labels}
+so_Multi <- FindTopFeatures(so_Multi, min.cutoff = "q90")
+so_Multi <- RunSVD(so_Multi, assay = "macs2Peaks")
+
+transfer.anchors <- FindTransferAnchors(
+  reference = so_Multi,
+  query = so_ATAC,
+  reference.neighbors = "weighted.nn",
+  reference.assay = 'macs2Peaks',
+  query.assay = 'macs2Peaks',
+  reduction = 'cca',
+  k.filter = NA,
+  k.score = 19
+)
+
+predicted.id <- TransferData(
+  anchorset = transfer.anchors,
+  refdata = so_Multi$CellType,
+  reference = so_Multi,
+  weight.reduction = "cca",
+  dims = 2:30
+)
+
+so_ATAC <- AddMetaData(
+  object = so_ATAC,
+  metadata = predicted.id
+)
+```
+
+```{r merge_data}
+
+so <- merge(so_ATAC, so_Multi)
+DefaultAssay(so) <- "macs2Peaks"
+so <- RunTFIDF(so)
+so <- FindTopFeatures(so, min.cutoff = "q0")
+so <- RunSVD(so, reduction.name = "macs2PeaksLSI")
+
+DefaultAssay(so) <- "ATAC"
+so <- RunTFIDF(so)
+so <- FindTopFeatures(so, min.cutoff = "q0")
+so <- RunSVD(so, reduction.name = "ATAClsi")
+
+so <- RunUMAP(
+  object = so, 
+  reduction = 'macs2PeaksLSI', 
+  dims = 2:40,
+  reduction.name = "umap.macs2peaks"
+)
+so <- RunUMAP(
+  object = so, 
+  reduction = 'ATAClsi', 
+  dims = 2:40,
+  reduction.name = "umap.atac"
+)
+
+```
+
+``` {r integrate_data}
+anchors <- FindIntegrationAnchors(
+  object.list = list(so_ATAC, so_Multi),
+  anchor.features = 5000,
+  assay = c('macs2Peaks', 'macs2Peaks'),
+  k.filter = NA
+)
+
+# integrate data and create a new merged object
+integrated <- IntegrateData(
+  anchorset = anchors,
+  dims = 2:30
+)
+
+# we now have a "corrected" TF-IDF matrix, and can run LSI again on this corrected matrix
+integrated <- RunSVD(
+  object = integrated,
+  n = 30,
+  reduction.name = 'integratedLSI'
+)
+
+integrated <- RunUMAP(
+  object = integrated,
+  dims = 2:30,
+  reduction = 'integratedLSI'
+)
+```
+
+``` {r save_data}
+faster_saveRDS(
+  so,
+  paste0(
+    figure_path(),
+    "merged_ATAC_so.rds"
+  )
+)
+
+faster_saveRDS(
+  integrated,
+  paste0(
+    figure_path(),
+    "integrated_ATAC_so.rds"
+  )
+)
+
+faster_saveRDS(
+  so_ATAC$predicted.id,
+  paste0(
+    figure_path(),
+    "so_ATAC_projected_cell_labels.rds"
+  )
+)
+```

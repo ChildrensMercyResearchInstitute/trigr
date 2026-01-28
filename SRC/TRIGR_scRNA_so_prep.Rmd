@@ -1,0 +1,363 @@
+---
+title: "TRIGR single cell RNA Seurat Object"
+output: html_document
+---
+
+```{r setup}
+
+# output directory path
+output_dir <- ".../TRIGR_scRNA_so_prep"
+
+# directory containing ONLY the single cell cellranger outputs
+cellranger_library_dir <- "..."
+
+
+library(dplyr)
+library(Seurat)
+library(Signac)
+library(sctransform)
+library(future)
+library(ggplot2)
+library(readr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(GenomicRanges)
+library(EnsDb.Hsapiens.v86)
+library(GenomeInfoDb)
+library(SingleCellExperiment)
+library(ExperimentHub)
+library(celldex)
+library(SeuratDisk)
+library(glmGamPoi)
+library(future)
+library(SingleR)
+
+
+plan("multiprocess", workers = 4)
+options(
+  future.globals.maxSize=50*1e9,
+  future.seed = TRUE
+)
+
+# Output folder for this document
+options(knitr.figure_dir = output_dir)
+
+source("knitr_common.r")
+```
+
+``` {r load_demuxlet_results}
+
+import_demux <- function(filename) {
+  read_tsv(filename, col_types=cols()) %>%
+    dplyr::select(barcode=BARCODE, droplet=DROPLET.TYPE, genotype=SNG.BEST.GUESS) %>%
+    dplyr::mutate(genotype = gsub("_2-.*\\.CEL$", "", genotype)) %>%
+    dplyr::mutate(genotype = gsub("^TRIGR_", "", genotype)) %>%
+    dplyr::mutate(barcode = substr(barcode, 1, 16))
+}
+
+demux_results <- list.files(
+  path="../DATA/demuxlet_scRNA",
+  pattern=".*\\.best$",
+  full.names=TRUE
+)
+names(demux_results) <- gsub("\\.best$", "", basename(demux_results))
+
+demux_df <- demux_results %>%
+  lapply(import_demux) %>%
+  bind_rows(.id="library") %>%
+  mutate(barcode = paste(library, barcode, sep = "_")) %>%
+  dplyr::select(-library) %>%
+  data.frame()
+
+```
+
+``` {r build_so_list}
+
+libs <- list.dirs(
+  path=cellranger_library_dir,
+  recursive=FALSE
+)
+libs <- libs[grepl("^10x", basename(libs), ignore.case=TRUE)]
+names(libs) <- basename(libs)
+
+sample_info <- read.csv(
+  paste(
+    "..",
+    "DATA",
+    "sample_info.csv",
+    sep = "/"
+  )
+)
+sample_info$genotype_ID <- as.character(sample_info$genotype_ID)
+
+case_ids <- sample_info %>% 
+  dplyr::select(genotype_ID, condition) %>% 
+  distinct() %>%
+  dplyr::filter(condition == "case") %>%
+  dplyr::pull(genotype_ID)
+
+cellranger_matrix_to_seurat <- function(lib_name) {
+  counts <- Read10X(
+    file.path(libs[[lib_name]], "outs", "filtered_feature_bc_matrix")
+  )
+  so <- CreateSeuratObject(counts, project="TRIGR")
+  so$library <- lib_name
+  so$capture <- substr(lib_name, nchar(lib_name), nchar(lib_name))
+  so$pool <- str_extract(lib_name, "10x_scPool_[0-9T]+")
+  so$barcode <- substr(rownames(so@meta.data), 1, 16)
+  so <- RenameCells(
+    so,
+    new.names = paste(
+      so$library,
+      so$barcode,
+      sep = "_"
+  ))
+  so$genotype_ID <- data.frame(demux_df$genotype, row.names = demux_df$barcode)
+  so$droplet_type <- data.frame(demux_df$droplet, row.names = demux_df$barcode)
+  no_demux_results <- rownames(so@meta.data)[is.na(so@meta.data$genotype)]
+  so <- subset(so, cells = no_demux_results, invert = TRUE)
+  meta <- so@meta.data
+  meta <- left_join(meta, sample_info, by = c("genotype_ID", "pool"))
+  rownames(meta) <- rownames(so@meta.data)
+  so@meta.data <- meta
+  so$percent_mt <- PercentageFeatureSet(so, pattern="^MT-")
+  so$percent_ribo <- PercentageFeatureSet(so, pattern="^RP[SL]")
+  so$assay <- "scRNA"
+  return(so)
+}
+
+so_merged <- cache(
+  "so_merged",
+  function() {
+    so_by_capture <-
+      mclapply(names(libs), cellranger_matrix_to_seurat, mc.cores = 8)
+    so_merged <- merge(
+      so_by_capture[[1]],
+      y = so_by_capture[2:length(so_by_capture)],
+      
+    )
+    return(so_merged)
+  }
+)
+
+so_by_pool <- SplitObject(so_merged, split.by = "pool")
+
+```
+
+``` {r plot_QC_statistics }
+
+VlnPlot(
+  so_merged,
+  group.by = "library",
+  features = "nCount_RNA",
+  pt.size = 0,
+  log = TRUE
+) + NoLegend()
+
+VlnPlot(
+  so_merged,
+  group.by = "library",
+  features = "nFeature_RNA",
+  pt.size = 0,
+  log = FALSE
+) + NoLegend()
+
+VlnPlot(
+  so_merged,
+  group.by = "library",
+  features = "percent_mt",
+  pt.size = 0,
+  log = FALSE
+) + NoLegend()
+
+VlnPlot(
+  so_merged,
+  group.by = "library",
+  features = "percent_ribo",
+  pt.size = 0,
+  log = FALSE
+) + NoLegend()
+```
+
+``` {r filter_and_normalize_data}
+
+rm(so_merged)
+
+so_by_pool <- cache(
+  "so_sctransform_by_pool",
+  function() {
+    for (pool in names(so_by_pool)) {
+      so_by_pool[[pool]] <- subset(
+        so_by_pool[[pool]],
+        subset =
+          percent_mt <= 10 &
+          nCount_RNA >= 2500 &
+          nFeature_RNA >= 800 &
+          droplet_type == "SNG"
+      )
+      so_by_pool[[pool]] <- SCTransform(
+        so_by_pool[[pool]],
+        return.only.var.genes = FALSE,
+        batch_var = "capture",
+        method = "glmGamPoi"
+      )
+    }
+    return(so_by_pool)
+  }
+)
+
+```
+
+```{r integration}
+so <- cache(
+  "so_integrated",
+  function() {
+    integration_features <- SelectIntegrationFeatures(
+      so_by_pool,
+      nfeatures = 3000)
+    so_by_pool <- PrepSCTIntegration(
+      so_by_pool,
+      anchor.features = integration_features)
+    #use object with largest number of cells as reference
+    ref_index <- which.max(sapply(so_by_pool, ncol))[[1]]
+    integration_anchors <- FindIntegrationAnchors(
+      so_by_pool,
+      normalization.method = "SCT",
+      anchor.features = integration_features,
+      reference = ref_index)
+    so <- IntegrateData(
+      integration_anchors,
+      normalization.method = "SCT"
+    )
+    so <- RunPCA(so, npcs = 150, verbose = FALSE)
+    return(so)
+  }
+)
+DefaultAssay(so) <- "integrated"
+
+rm(so_by_pool)
+
+```
+
+```{r dimensional_reduction}
+#run first round of linear dimensional reduction
+
+ElbowPlot(so, ndims = 150)
+ElbowPlot(so, ndims = 100)
+ElbowPlot(so, ndims = 50)
+
+so <- JackStraw(so, dims = 100)
+so <- ScoreJackStraw(so, dims = 1:100)
+JackStrawPlot(so, dims = 1:100) + NoLegend()
+
+num_signif_dims <- 50
+so <- RunUMAP(so, dims = 1:num_signif_dims)
+```
+
+``` {r clustering}
+so <- FindNeighbors(so, dims = 1:num_signif_dims)
+
+#cluster with multiple resolution settings
+so <- FindClusters(so, resolution = 0.5, verbose = FALSE)
+so <- FindClusters(so, resolution = 0.8, verbose = FALSE)
+so <- FindClusters(so, resolution = 1.0, verbose = FALSE)
+so <- FindClusters(so, resolution = 1.5, verbose = FALSE)
+so <- FindClusters(so, resolution = 2.0, verbose = FALSE)
+```
+
+``` {r assign_cells_singleR}
+hpca.se <- celldex::HumanPrimaryCellAtlasData()
+encode.se <- celldex::BlueprintEncodeData()
+
+Idents(so) <- "integrated_snn_res.0.5"
+DefaultAssay(so) <- "SCT"
+
+single_cell_experiment_object <- as.SingleCellExperiment(so)
+predicted_cell_types_HPCA <- SingleR(
+  single_cell_experiment_object,
+  ref = hpca.se,
+  labels = hpca.se$label.main
+)
+predicted_cell_types_ENCODE <- SingleR(
+  single_cell_experiment_object,
+  ref = encode.se,
+  labels = encode.se$label.main
+)
+so$SingleR_labels_HPCA <- predicted_cell_types_HPCA$labels
+so$SingleR_labels_ENCODE <- predicted_cell_types_ENCODE$labels
+```
+
+``` {r assign_cells_CITE_seq}
+CITE_seq_data <- LoadH5Seurat(
+  paste(
+    "..",
+    "DATA",
+    "pbmc_multimodal.h5seurat",
+    sep = "/"
+  )
+)
+
+anchors <- FindTransferAnchors(
+  reference = CITE_seq_data,
+  query = so,
+  normalization.method = "SCT",
+  reference.reduction = "spca",
+  dims = 1:50,
+  reference.assay = "SCT",
+  query.assay = "SCT"
+)
+
+so <- MapQuery(
+  anchorset = anchors,
+  query = so,
+  reference = CITE_seq_data,
+  refdata = list(
+    celltype_coarse = "celltype.l1",
+    celltype_fine = "celltype.l2",
+    predicted_ADT = "ADT"
+  ),
+  reference.reduction = "spca",
+  reduction.model = "wnn.umap"
+)
+
+```
+
+``` {r save_data}
+faster_saveRDS(
+  so@meta.data,
+  paste(
+    output_dir,
+    "metadata.rds",
+    sep = "/"
+  )
+)
+
+faster_saveRDS(
+  so@reductions$umap,
+  paste(
+    output_dir,
+    "umap_reduction.rds",
+    sep = "/"
+  )
+)
+
+faster_saveRDS(
+  so@reductions$ref.umap,
+  paste(
+    output_dir,
+    "CITE_seq_umap_reduction.rds",
+    sep = "/"
+  )
+)
+
+faster_saveRDS(
+  so@commands,
+  paste(
+    output_dir,
+    "commands.rds",
+    sep = "/"
+  )
+)
+
+```

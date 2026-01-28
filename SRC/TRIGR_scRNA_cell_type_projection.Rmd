@@ -1,0 +1,167 @@
+---
+title: "TRIGR_scRNA_cell_type_projection"
+output: html_document
+---
+
+```{r setup}
+
+library(dplyr)
+library(Seurat)
+library(Signac)
+library(sctransform)
+library(future)
+library(ggplot2)
+library(readr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(GenomicRanges)
+library(EnsDb.Hsapiens.v86)
+library(GenomeInfoDb)
+library(SingleCellExperiment)
+library(ExperimentHub)
+library(celldex)
+library(SeuratDisk)
+library(glmGamPoi)
+library(future)
+library(SingleR)
+
+# scRNA prep output directory
+seurat_scrna_prep <- ".../TRIGR_scRNA_so_prep"
+# multiome prep output directory
+seurat_scmulti_prep <- ".../TRIGR_scMulti_so_prep"
+# multiome cell type output directory
+seurat_scmulti_cells <- ".../TRIGR_scMulti_cell_type_curation"
+project_dir <- "..."
+subanalysis_name <- "TRIGR_scRNA_cell_type_projection"
+
+options(
+  future.globals.maxSize=100*1e9
+)
+
+# Output folder for this document
+options(knitr.figure_dir = paste0(
+  project_dir, "/", 
+  subanalysis_name
+  )
+)
+
+source("knitr_common.r")
+```
+
+
+``` {r load_scRNA_data}
+so_RNA <- faster_readRDS(
+  paste(
+    seurat_scrna_prep,
+    "so_integrated.rds",
+    sep = "/"
+  )
+)
+
+so_RNA@meta.data <- faster_readRDS(
+  paste(
+    seurat_scrna_prep,
+    "metadata.rds",
+    sep = "/"
+  )
+)
+
+so_RNA@commands <- faster_readRDS(
+  paste(
+    seurat_scrna_prep,
+    "commands.rds",
+    sep = "/"
+  )
+)
+
+so_RNA@reductions$umap <- faster_readRDS(
+  paste(
+    seurat_scrna_prep,
+    "umap_reduction.rds",
+    sep = "/"
+  )
+)
+
+```
+
+``` {r load_scMulti_data}
+so_Multi <- faster_readRDS(
+  paste(
+    seurat_scmulti_prep,
+    "so_integrated_no_batch_var.rds",
+    sep = "/"
+  )
+)
+
+so_Multi@meta.data <- faster_readRDS(
+  paste(
+    seurat_scmulti_prep,
+    "metadata.rds",
+    sep = "/"
+  )
+)
+
+so_Multi@commands <- faster_readRDS(
+  paste(
+    seurat_scmulti_prep,
+    "commands.rds",
+    sep = "/"
+  )
+)
+
+so_Multi@assays$macs2Peaks <- faster_readRDS(
+  paste(
+    seurat_scmulti_prep,
+    "macs2_peaks_ATAC_assay_w_links_cluster_run.rds",
+    sep = "/"
+  )
+)
+
+
+so_Multi$CellType <- faster_readRDS(
+  paste(
+    seurat_scmulti_cells,
+    "cell_labels.rds",
+    sep = "/"
+  )
+)
+
+
+```
+
+``` {r transfer_cell_labels}
+
+so_RNA <- UpdateSeuratObject(so_RNA)
+so_RNA <- UpdateSCTAssays(so_RNA)
+
+transfer.anchors <- FindTransferAnchors(
+  reference = so_Multi,
+  query = so_RNA,
+  reference.assay = 'integratedRNA',
+  query.assay = 'integrated', 
+  recompute.residuals = FALSE
+)
+
+predicted.id <- TransferData(
+  anchorset = transfer.anchors,
+  refdata = so_Multi$CellType,
+  reference = so_Multi
+)
+
+so_RNA <- AddMetaData(
+  object = so_RNA,
+  metadata = predicted.id
+)
+```
+
+
+``` {r save_results}
+faster_saveRDS(
+  so_RNA$predicted.id,
+  paste0(
+    figure_path(),
+    "so_RNA_projected_cell_labels.rds"
+  )
+)
+```

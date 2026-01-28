@@ -1,0 +1,153 @@
+---
+title: "TRIGR_scATAC_macs2_peaks_from_scMulti_quantification"
+output: html_document
+---
+
+```{r setup}
+
+library(dplyr)
+library(Seurat)
+library(Signac)
+library(sctransform)
+library(future)
+library(ggplot2)
+library(readr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(GenomicRanges)
+library(EnsDb.Hsapiens.v86)
+library(GenomeInfoDb)
+library(SingleCellExperiment)
+library(ExperimentHub)
+library(celldex)
+library(SeuratDisk)
+library(glmGamPoi)
+library(future)
+library(SingleR)
+
+# scatac prep dir
+seurat_scatac_dir <- ".../TRIGR_scATAC_so_prep"
+# multiome prep dir
+seurat_scmulti_dir <- ".../TRIGR_scMulti_so_prep"
+# scatac cell types output dir
+seurat_scatac_cells <- ".../TRIGR_scATAC_cell_type_curation"
+
+# top level output directory
+project_dir <- "..."
+# subanalysis output directory
+subanalysis_name <- "TRIGR_scATAC_macs2_peaks_from_scMulti_quantification"
+
+options(
+  future.globals.maxSize=100*1e9
+)
+
+# Output folder for this document
+options(knitr.figure_dir = paste0(
+  project_dir, "/",  
+  subanalysis_name
+  )
+)
+
+source("knitr_common.r")
+```
+
+
+``` {r load_data}
+so <- faster_readRDS(
+  paste(
+    seurat_scatac_dir,
+    "so_scATAC.rds",
+    sep = "/"
+  )
+)
+
+so@meta.data <- faster_readRDS(
+  paste(
+    seurat_scatac_dir,
+    "metadata.rds",
+    sep = "/"
+  )
+)
+
+so@commands <- faster_readRDS(
+  paste(
+    seurat_scatac_dir,
+    "commands.rds",
+    sep = "/"
+  )
+)
+
+so@reductions$umap <- faster_readRDS(
+  paste(
+    seurat_scatac_dir,
+    "umap_reduction.rds",
+    sep = "/"
+  )
+)
+
+so@reductions$CITE_seq_umap <- faster_readRDS(
+  paste(
+    seurat_scatac_dir,
+    "CITE_seq_umap_reduction.rds",
+    sep = "/"
+  )
+)
+
+so$CellType <- faster_readRDS(
+  paste(
+    seurat_scatac_cells,
+    "cell_labels.rds",
+    sep = "/"
+  )
+)
+
+scMulti_macs2peaks <- faster_readRDS(
+  paste(
+    seurat_scmulti_dir,
+    "macs2_peaks.rds",
+    sep = "/"
+  )
+)
+
+```
+
+``` {r count_fragments}
+
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+seqlevelsStyle(annotations) <- "UCSC"
+genome(annotations) <- "GRCh38"
+
+scMulti_macs2peaks <- keepStandardChromosomes(
+  scMulti_macs2peaks,
+  pruning.mode = 'tidy'
+)
+
+scMulti_macs2peaks_counts <- FeatureMatrix(
+  fragments = Fragments(so),
+  features = scMulti_macs2peaks,
+  cells = colnames(so)
+)
+
+so[['scMultiMacs2peaks']] <- CreateChromatinAssay(
+  counts = scMulti_macs2peaks_counts,
+  min.cells = 1,
+  ranges = scMulti_macs2peaks,
+  genome = 'GRCh38'
+)
+
+Annotation(so@assays$scMultiMacs2peaks) <- annotations
+DefaultAssay(so) <- 'scMultiMacs2peaks'
+so <- RunTFIDF(so)
+
+```
+
+``` {r save_data}
+faster_saveRDS(
+  so@assays$scMultiMacs2peaks,
+  paste0(
+    figure_path(),
+    "scMulti_macs2Peaks_assay.rds"
+  )
+)
+```

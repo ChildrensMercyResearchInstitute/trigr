@@ -1,0 +1,143 @@
+---
+title: "TRIGR_scATAC_cell_type_curation"
+output: html_document
+---
+
+```{r setup}
+
+library(dplyr)
+library(Seurat)
+library(Signac)
+library(sctransform)
+library(future)
+library(ggplot2)
+library(readr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(GenomicRanges)
+library(EnsDb.Hsapiens.v86)
+library(GenomeInfoDb)
+library(SingleCellExperiment)
+library(ExperimentHub)
+library(celldex)
+library(SeuratDisk)
+library(glmGamPoi)
+library(future)
+library(SingleR)
+
+# scATAC seurat object location
+seurat_dir <- ".../TRIGR_scATAC_so_prep"
+
+
+# top level project output directory
+project_dir <- "..."
+# subanalysis output directory
+subanalysis_name <- "TRIGR_scATAC_cell_type_curation"
+
+options(
+  future.globals.maxSize=100*1e9
+)
+
+# Output folder for this document
+options(knitr.figure_dir = paste0(
+  project_dir, "/", 
+  subanalysis_name
+  )
+)
+
+source("knitr_common.r")
+```
+
+
+``` {r load_data}
+so <- faster_readRDS(
+  paste(
+    seurat_dir,
+    "so_scATAC.rds",
+    sep = "/"
+  )
+)
+
+so@meta.data <- faster_readRDS(
+  paste(
+    seurat_dir,
+    "metadata.rds",
+    sep = "/"
+  )
+)
+
+so@commands <- faster_readRDS(
+  paste(
+    seurat_dir,
+    "commands.rds",
+    sep = "/"
+  )
+)
+
+so@reductions$umap <- faster_readRDS(
+  paste(
+    seurat_dir,
+    "umap_reduction.rds",
+    sep = "/"
+  )
+)
+
+so@reductions$CITE_seq_umap <- faster_readRDS(
+  paste(
+    seurat_dir,
+    "CITE_seq_umap_reduction.rds",
+    sep = "/"
+  )
+)
+
+```
+
+``` {r identify_cells}
+
+DefaultAssay(so) <- "RNA"
+Idents(so) <- "ATAC_snn_res.0.8"
+
+DimPlot(so, label = TRUE, reduction = "umap.atac") + NoLegend()
+DimPlot(so, label = TRUE, reduction = "umap.atac", group.by = "SingleR_labels_ENCODE") + NoLegend()
+
+FeaturePlot(so, label = TRUE, features = "PTPRC", reduction = "umap.atac") + NoLegend()
+
+FindMarkers(so, ident.1 = 15, only.pos = TRUE, max.cells.per.ident = 200) %>% arrange(desc(avg_log2FC)) %>% head(25)
+```
+
+```{r assign_cells}
+cd8_t_cells <- WhichCells(so, expression = `ATAC_snn_res.0.8` %in% c(2, 7, 8, 9))
+cd4_t_cells <- WhichCells(so, expression = `ATAC_snn_res.0.8` %in% c(0, 3, 10, 13, 16))
+NK_cells <- WhichCells(so, expression = `ATAC_snn_res.0.8` %in% c(4, 12))
+b_cells <- WhichCells(so, expression = `ATAC_snn_res.0.8` %in% c(1, 6, 17, 18, 20))
+CD16_monocytes <- WhichCells(so, expression = `ATAC_snn_res.0.8` %in% c(11))
+CD14_monocytes <- WhichCells(so, expression = `ATAC_snn_res.0.8` %in% c(5))
+cDCs <- WhichCells(so, expression = `ATAC_snn_res.0.8` %in% c(14))
+unknown_1 <- WhichCells(so, expression = `ATAC_snn_res.0.8` %in% c(15))
+unknown_2 <- WhichCells(so, expression = `ATAC_snn_res.0.8` %in% c(19))
+
+so$CellType <- "NA"
+so@meta.data[b_cells, "CellType"] <- "B"
+so@meta.data[cd8_t_cells, "CellType"] <- "CD8 T"
+so@meta.data[cd4_t_cells, "CellType"] <- "CD4 T"
+so@meta.data[NK_cells, "CellType"] <- "NK"
+so@meta.data[cDCs, "CellType"] <- "cDC"
+so@meta.data[CD16_monocytes, "CellType"] <- "CD16 Mono"
+so@meta.data[CD14_monocytes, "CellType"] <- "CD14 Mono"
+so@meta.data[unknown_1, "CellType"] <- "Unknown #1"
+so@meta.data[unknown_2, "CellType"] <- "Unknown #2"
+
+```
+
+``` {r save_data}
+faster_saveRDS(
+  so$CellType,
+  paste(
+    project_dir,
+    subanalysis_name,
+    "cell_labels.rds",
+    sep = "/"
+  )
+)
+```

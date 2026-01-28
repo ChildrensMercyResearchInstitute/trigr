@@ -1,0 +1,129 @@
+---
+title: "2021_05_04_TRIGR_scATAC_average_accessibility"
+output: html_document
+---
+
+```{r setup}
+
+library(dplyr)
+library(Seurat)
+library(Signac)
+library(sctransform)
+library(future)
+library(ggplot2)
+library(readr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(GenomicRanges)
+library(EnsDb.Hsapiens.v86)
+library(GenomeInfoDb)
+library(SingleCellExperiment)
+library(ExperimentHub)
+library(celldex)
+library(SeuratDisk)
+library(glmGamPoi)
+library(future)
+library(SingleR)
+
+# merged ATAC seurat object 
+seurat_merged_dir <- ".../TRIGR_scATAC_scMulti_merging"
+# scATAC macs2 using multiome peaks
+seurat_scatac_macs2 <- ".../TRIGR_scATAC_macs2_peaks_from_scMulti_quantification"
+
+# scATAC seurat object location
+seurat_scatac_dir <- ".../TRIGR_scATAC_so_prep"
+
+
+
+# Top level output dir
+project_dir <- "..."
+# subanalysis output directory
+subanalysis_name <- "TRIGR_scATAC_average_accessibility"
+
+options(
+  future.globals.maxSize=100*1e9
+)
+
+# Output folder for this document
+options(knitr.figure_dir = paste0(
+  project_dir, "/",
+  subanalysis_name
+  )
+)
+
+source("knitr_common.r")
+```
+
+
+``` {r load_scATAC_data}
+so_ATAC <- faster_readRDS(
+  paste(
+    seurat_scatac_dir,
+    "so_scATAC.rds",
+    sep = "/"
+  )
+)
+
+so_ATAC@meta.data <- faster_readRDS(
+  paste(
+    seurat_scatac_dir,
+    "metadata.rds",
+    sep = "/"
+  )
+)
+
+so_ATAC@commands <- faster_readRDS(
+  paste(
+    seurat_scatac_dir,
+    "commands.rds",
+    sep = "/"
+  )
+)
+
+so_ATAC$CellType <- faster_readRDS(
+  paste(
+    seurat_merged_dir,
+    "so_ATAC_projected_cell_labels.rds",
+    sep = "/"
+  )
+)
+
+so_ATAC@assays$macs2Peaks <- faster_readRDS(
+  paste(
+    seurat_scatac_macs2,
+    "scMulti_macs2Peaks_assay.rds",
+    sep = "/"
+  )
+)
+
+```
+
+
+``` {r get_average_counts}
+
+so_ATAC$CellType_by_TP <- paste(so_ATAC$CellType, "TP", so_ATAC$timepoint, sep = "_")
+
+so_ATAC$nCount_macs2Peaks <- colSums(so_ATAC@assays$macs2Peaks@counts)
+
+averages_cell_by_tp <- AverageExpression(so_ATAC, assays = "macs2Peaks", group.by = "CellType_by_TP")
+averages_cell_type <- AverageExpression(so_ATAC, assays = "macs2Peaks", group.by = "CellType")
+averages_overall <- AverageExpression(so_ATAC, assays = "macs2Peaks", group.by = "orig.ident")
+```
+
+``` {r save_results}
+faster_saveRDS(
+  averages_cell_by_tp$macs2Peaks,
+  file = paste0(figure_path(), "average_peak_counts_by_cell_by_tp.rds")
+)
+faster_saveRDS(
+  averages_cell_type$macs2Peaks,
+  file = paste0(figure_path(), "average_peak_counts_by_cell.rds")
+)
+faster_saveRDS(
+  averages_overall$macs2Peaks,
+  file = paste0(figure_path(), "average_peak_counts_overall.rds")
+)
+```
+
+

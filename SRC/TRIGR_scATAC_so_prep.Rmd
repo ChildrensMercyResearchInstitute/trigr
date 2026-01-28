@@ -1,0 +1,420 @@
+---
+title: "TRIGR single cell ATAC Seurat object"
+output: html_document
+---
+
+```{r setup, echo=FALSE, message=FALSE, include=FALSE, error=FALSE}
+
+# output directory path
+output_dir <- ".../TRIGR_scATAC_so_prep"
+# cellranger aggr results directory (should contain a subdir called outs/ )
+cellranger_aggr_dir <- "..."
+
+#  Download cite-seq reference data to DATA/
+#  https://atlas.fredhutch.org/data/nygc/multimodal/pbmc_multimodal.h5seurat
+#  from https://atlas.fredhutch.org/nygc/multimodal-pbmc/ 
+
+library(dplyr)
+library(Seurat)
+library(Signac)
+library(SeuratDisk)
+library(sctransform)
+library(future)
+library(ggplot2)
+library(readr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(GenomicRanges)
+library(EnsDb.Hsapiens.v86)
+library(GenomeInfoDb)
+library(SingleCellExperiment)
+library(ExperimentHub)
+library(celldex)
+library(SingleR)
+
+
+plan("multiprocess", workers = 4)
+options(
+  future.globals.maxSize=50*1e9,
+  future.seed = TRUE
+)
+
+
+# Output folder for this document
+options(knitr.figure_dir = output_dir
+)
+
+source("knitr_common.r")
+```
+
+``` {r load_demuxlet_results}
+
+files <- list.files(path = 'DATA/demuxlet_scATAC',
+                    pattern = 'TRIGR_10x_scPool_000..*.b38.pool.alpha.0.1-0.5.gt.best',
+                    full.names = T)
+names(files) <- str_extract(files, '10x_scPool_000[^.]+')
+
+demux <- lapply(files, read_tsv) %>% bind_rows(.id = 'POOL')
+demux %<>% dplyr::mutate(BEST.GUESS = str_extract(BEST.GUESS, '^[^,]+')) # %>% dplyr::filter(DROPLET.TYPE == 'SNG')
+
+demux %<>% left_join(aggr_sheet, by = c('POOL' = 'library_id')) %>%
+  mutate(BARCODE_AGGR=str_replace(BARCODE, '1$', as.character(id)))
+
+demux_df <- demux %>%
+  dplyr::select(library=POOL, barcode=BARCODE, droplet=DROPLET.TYPE, genotype_ID=SNG.BEST.GUESS) %>%
+  mutate(library = gsub("_cap", "_Cap", library)) %>% 
+  mutate(library = gsub("10x_scPool_00078", "10x_scPool_00078T", library)) %>%
+  mutate(library = gsub("10x_scPool_00079", "10x_scPool_00079T", library)) %>%
+  mutate(library = gsub("10x_scPool_00080", "10x_scPool_00080T", library)) %>%
+  mutate(genotype_ID = gsub("_2-.*\\.CEL$", "", genotype_ID)) %>%
+  mutate(genotype_ID = gsub("^TRIGR_", "", genotype_ID)) %>%
+  mutate(barcode = substr(barcode, 1, 16)) %>%
+  mutate(barcode = paste(library, barcode, sep = "_")) %>%
+  dplyr::select(-library) %>%
+  data.frame()
+```
+
+```{r make_peaks_list}
+lymph_peaks <-
+  read.table(
+    "../DATA/lymphoid_DHS.bed",
+    col.names = c("chr", "start", "end")) %>%
+  makeGRangesFromDataFrame()
+
+myel_peaks <-
+  read.table(
+    "../DATA/myeloid_erythroid_DHS.bed",
+    col.names = c("chr", "start", "end")) %>%
+  makeGRangesFromDataFrame()
+
+blood_peaks <- reduce(c(lymph_peaks, myel_peaks))
+```
+
+```{r build_metadata}
+sample_info <- read.csv(
+  paste(
+    ".."
+    "DATA",
+    "sample_info.csv",
+    sep = "/"
+  )
+)
+sample_info$genotype_ID <- as.character(sample_info$genotype_ID)
+
+
+meta <- read.csv(paste0(cellranger_aggr_dir, "/outs/singlecell.csv"))
+info <- strsplit(meta$barcode, "-") %>% unlist
+meta$library <- info[c(FALSE, TRUE)] %>% recode(
+               `1` = "10x_scPool_00078T_scATAC_Cap1", `2` = "10x_scPool_00078T_scATAC_Cap2",
+               `3` = "10x_scPool_00078T_scATAC_Cap3", `4` = "10x_scPool_00078T_scATAC_Cap4",
+               `5` = "10x_scPool_00079T_scATAC_Cap1", `6` = "10x_scPool_00079T_scATAC_Cap2",
+               `7` = "10x_scPool_00079T_scATAC_Cap3", `8` = "10x_scPool_00079T_scATAC_Cap4",
+               `9` = "10x_scPool_00080T_scATAC_Cap1", `10` = "10x_scPool_00080T_scATAC_Cap2",
+               `11` = "10x_scPool_00080T_scATAC_Cap3", `12` = "10x_scPool_00080T_scATAC_Cap4",
+               `13` = "10x_scPool_00080T_scATAC_Cap5", `14` = "10x_scPool_00080T_scATAC_Cap6",
+               `15` = "10x_scPool_00080T_scATAC_Cap7", `16` = "10x_scPool_00080T_scATAC_Cap8",
+               `17` = "10x_scPool_00082_scATAC_Cap1", `18` = "10x_scPool_00082_scATAC_Cap2",
+               `19` = "10x_scPool_00082_scATAC_Cap3", `20` = "10x_scPool_00082_scATAC_Cap4",
+               `21` = "10x_scPool_00083_scATAC_Cap1", `22` = "10x_scPool_00083_scATAC_Cap2",
+               `23` = "10x_scPool_00083_scATAC_Cap3", `24` = "10x_scPool_00083_scATAC_Cap4"
+               )
+meta$capture <- str_sub(meta$library, -1, -1)
+meta$pool <- str_sub(meta$library, 1, -13)
+meta$aggr_code <- substr(meta$barcode, 18, 20)
+meta$barcode <- substr(meta$barcode, 1, 16)
+rownames(meta) <- paste(meta$library, meta$barcode, sep = "_")
+meta <- tidyr::unite(meta, "cellranger_names", barcode, aggr_code, sep = "-", remove = FALSE)
+meta <- left_join(
+  meta %>% mutate(droplet_name = rownames(meta)),
+  demux_df %>% mutate(droplet_name = demux_df$barcode),
+  by = "droplet_name") %>%
+  dplyr::select(-barcode.y) %>%
+  dplyr::rename(barcode = `barcode.x`, droplet_type = droplet) %>%
+  column_to_rownames(var = "droplet_name") %>%
+  dplyr::select(-one_of(
+    "TSS_fragments", "DNase_sensitive_region_fragments", "enhancer_region_fragments",
+    "promoter_region_fragments", "on_target_fragments", "blacklist_region_fragments",
+    "peak_region_fragments", "peak_region_cutsites", "passed_filters",
+    "duplicate", "cell_id")) %>%
+  dplyr::filter(is__cell_barcode == 1) %>%
+  data.frame()
+to_drop <- which(is.na(meta$genotype))
+meta <- meta[-to_drop,]
+final_meta <- left_join(meta, sample_info, by = c("genotype_ID", "pool"))
+rownames(final_meta) <- rownames(meta)
+
+```
+
+``` {r build_so}
+
+good_cells <- final_meta %>%
+  dplyr::pull(cellranger_names)
+
+scATAC_so <- cache(
+  "so_scATAC_raw",
+  function() {
+    scATAC_frags <- CreateFragmentObject(
+      path = paste(
+        cellranger_aggr_dir,
+        'outs',
+        "fragments.tsv.gz",
+        sep = "/"
+      ),
+      cells = good_cells
+    )
+    scATAC_counts <- FeatureMatrix(
+      fragments = scATAC_frags,
+      features = blood_peaks,
+      cells = good_cells
+    )
+    scATAC_assay <- CreateChromatinAssay(
+      scATAC_counts,
+      fragments = scATAC_frags
+    )
+    final_meta <- final_meta %>%
+      rownames_to_column(var = "full_droplet_name") %>%
+      column_to_rownames(var = "cellranger_names") %>%
+      data.frame()
+    scATAC_so <- CreateSeuratObject(
+      scATAC_assay,
+      assay = "ATAC",
+      meta.data = final_meta,
+      project = "TRIGR"
+    )
+    annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+    seqlevelsStyle(annotations) <- "UCSC"
+    genome(annotations) <- "GRCh38"
+    Annotation(scATAC_so) <- annotations
+    genome(scATAC_so) <- "GRCh38"
+    
+    total_fragments <- CountFragments(
+      paste(
+        cellranger_aggr_dir,
+        'outs',
+        "fragments.tsv.gz",
+        sep = "/"
+      )
+    )
+    scATAC_so$fragments <- data.frame(total_fragments$frequency_count,
+                                      row.names = total_fragments$CB)
+    scATAC_so <- FRiP(
+      object = scATAC_so,
+      assay = 'ATAC',
+      total.fragments = 'fragments'
+    )
+    scATAC_so <- NucleosomeSignal(object = scATAC_so)
+    scATAC_so <- TSSEnrichment(object = scATAC_so, fast = FALSE)
+    scATAC_so$blacklist_fraction <- FractionCountsInRegion(
+      object = scATAC_so,
+      assay = 'ATAC',
+      regions = blacklist_hg38
+    )
+    return(scATAC_so)
+  }
+)
+
+```
+
+
+``` {r plot_QC_statistics}
+
+VlnPlot(
+  scATAC_so,
+  group.by = "library",
+  features = "fragments",
+  pt.size = 0,
+  log = FALSE
+) + NoLegend()
+
+VlnPlot(
+  scATAC_so,
+  group.by = "library",
+  features = "FRiP",
+  pt.size = 0,
+  log = FALSE
+) + NoLegend()
+
+VlnPlot(
+  scATAC_so,
+  group.by = "library",
+  features = "blacklist_fraction",
+  pt.size = 0,
+  log = FALSE
+) + NoLegend()
+
+VlnPlot(
+  scATAC_so,
+  group.by = "library",
+  features = "nucleosome_signal",
+  pt.size = 0,
+  log = FALSE
+) + NoLegend()
+
+VlnPlot(
+  scATAC_so,
+  group.by = "library",
+  features = "TSS.enrichment",
+  pt.size = 0,
+  log = FALSE
+) + NoLegend()
+
+```
+
+
+``` {r filter_and_normalize_data}
+
+scATAC_so <- subset(
+  x = scATAC_so,
+  subset = fragments > 2000 &
+    fragments < 30000 &
+    FRiP > .15 &
+    blacklist_fraction < 0.025 &
+    nucleosome_signal < 4 &
+    TSS.enrichment > 3 &
+    droplet_type == "SNG"
+)
+
+scATAC_so <- cache(
+  "so_scATAC",
+  function() {
+    scATAC_so <- RunTFIDF(scATAC_so)
+    scATAC_so <- FindTopFeatures(scATAC_so, min.cutoff = 'q25')
+    scATAC_so <- RunSVD(scATAC_so)
+    
+    scATAC_so <- RunUMAP(
+      scATAC_so,
+      reduction = 'lsi',
+      dims = 2:50,
+      reduction.name = "umap.atac",
+      reduction.key = "atacUMAP_")
+    scATAC_so <- FindNeighbors(object = scATAC_so, reduction = 'lsi', dims = 2:50)
+    scATAC_so <- FindClusters(object = scATAC_so, verbose = FALSE, algorithm = 3)
+    gene_activities <- GeneActivity(scATAC_so, process_n = 500)
+    scATAC_so[['RNA']] <- CreateAssayObject(counts = gene_activities)
+    scATAC_so <- NormalizeData(
+      object = scATAC_so,
+      assay = 'RNA',
+      normalization.method = 'LogNormalize',
+      scale.factor = median(scATAC_so$nCount_RNA)
+    )
+    return(scATAC_so)
+  }
+)
+
+
+```
+
+``` {r assign_cells_singleR}
+DefaultAssay(scATAC_so) <- "RNA"
+hpca.se <- celldex::HumanPrimaryCellAtlasData()
+encode.se <- celldex::BlueprintEncodeData()
+
+single_cell_experiment_object <- as.SingleCellExperiment(scATAC_so)
+
+predicted_cell_types_HPCA <- SingleR(
+  single_cell_experiment_object,
+  ref = hpca.se,
+  labels = hpca.se$label.main
+)
+predicted_cell_types_ENCODE <- SingleR(
+  single_cell_experiment_object,
+  ref = encode.se,
+  labels = encode.se$label.main
+)
+scATAC_so$SingleR_labels_HPCA <- predicted_cell_types_HPCA$labels
+scATAC_so$SingleR_labels_ENCODE <- predicted_cell_types_ENCODE$labels
+```
+
+``` {r assign_cells_CITE_seq}
+CITE_seq_data <- LoadH5Seurat(
+  paste(
+    "..",
+    "DATA",
+    "pbmc_multimodal.h5seurat",
+    sep = "/"
+  )
+)
+
+scATAC_so <- SCTransform(scATAC_so)
+
+anchors <- FindTransferAnchors(
+  reference = CITE_seq_data,
+  query = scATAC_so,
+  normalization.method = "SCT",
+  reference.reduction = "spca",
+  dims = 1:50,
+  reference.assay = "SCT",
+  query.assay = "SCT"
+)
+
+scATAC_so <- MapQuery(
+  anchorset = anchors,
+  query = scATAC_so,
+  reference = CITE_seq_data,
+  refdata = list(
+    celltype_coarse = "celltype.l1",
+    celltype_fine = "celltype.l2"
+  ),
+  reference.reduction = "spca",
+  reduction.model = "wnn.umap"
+)
+
+```
+
+``` {r macs2_peaks}
+DefaultAssay(scATAC_so) <- "ATAC"
+
+macs2_peaks <- CallPeaks(
+  object = scATAC_so,
+  group.by = "ATAC_snn_res.0.8"
+)
+```
+
+``` {r save_data}
+saveRDS(
+  scATAC_so@meta.data,
+  paste(
+    output_dir,
+    "metadata.rds",
+    sep = "/"
+  )
+)
+
+saveRDS(
+  scATAC_so@reductions$umap.atac,
+  paste(
+    output_dir,
+    "umap_reduction.rds",
+    sep = "/"
+  )
+)
+
+faster_saveRDS(
+  scATAC_so@reductions$ref.umap,
+  paste(
+    output_dir,
+    "CITE_seq_umap_reduction.rds",
+    sep = "/"
+  )
+)
+
+saveRDS(
+  scATAC_so@commands,
+  paste(
+    output_dir,
+    "commands.rds",
+    sep = "/"
+  )
+)
+
+saveRDS(
+  macs2_peaks,
+  paste(
+    output_dir,
+    "macs2_peaks.rds",
+    sep = "/"
+  )
+)
+
+```

@@ -1,0 +1,323 @@
+---
+title: "TRIGR_scRNA_scATAC_link_correlation"
+output: html_document
+---
+
+```{r setup}
+
+library(tibble)
+library(dplyr)
+library(Seurat)
+library(Signac)
+library(sctransform)
+library(future)
+library(ggplot2)
+library(readr)
+library(tidyr)
+library(stringr)
+library(GenomicRanges)
+library(EnsDb.Hsapiens.v86)
+library(GenomeInfoDb)
+library(SingleCellExperiment)
+library(ExperimentHub)
+library(celldex)
+library(SeuratDisk)
+library(glmGamPoi)
+library(future)
+library(SingleR)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+
+
+# Top level output dir
+project_dir <- "..."
+# subanalysis output directory
+subanalysis_name <- 
+  "TRIGR_scRNA_scATAC_link_correlation"
+
+# average scATAC output dir
+seurat_scatac_dir <- paste0(project_dir, "/TRIGR_scATAC_average_accessibility")
+# average scRNA output dir
+seurat_scrna_dir <- paste0(project_dir, "/TRIGR_scRNA_average_expression")
+
+# scmulti prep output dir
+seurat_scmulti_prep_dir <- ".../TRIGR_scMulti_so_prep"
+
+options(future.globals.maxSize=100*1e9)
+
+# Output folder for this document
+options(knitr.figure_dir = paste0(
+  project_dir, "/",
+  subanalysis_name
+  )
+)
+
+source("knitr_common.r")
+```
+
+``` {r load_data}
+average_peaks <- faster_readRDS(
+  paste(
+    seurat_scatac_dir,
+    "average_peak_counts_by_cell.rds",
+    sep = "/"
+  )
+)
+
+average_exp_overall <- faster_readRDS(
+  paste(
+    seurat_scrna_dir,
+    "average_exp_overall.rds",
+    sep = "/"
+  )
+)
+
+average_peaks_overall <- faster_readRDS(
+  paste(
+    seurat_scatac_dir,
+    "average_peak_counts_overall.rds",
+    sep = "/"
+  )
+)
+
+average_exp <- faster_readRDS(
+  paste(
+    seurat_scrna_dir,
+    "average_exp_by_cell.rds",
+    sep = "/"
+  )
+)
+
+links1 <- faster_readRDS(
+  paste(
+    seurat_scmulti_prep_dir,
+    "macs2_peaks_ATAC_assay_w_links_cluster_run.rds",
+    sep = "/"
+  )
+)@links %>% as.data.frame()
+
+links2 <- faster_readRDS(
+  paste(
+    seurat_scmulti_prep_dir,
+    "macs2_peaks_long_range_links.rds",
+    sep = "/"
+  )
+) %>% as.data.frame()
+
+macs2_links <- rbind(links1, links2) %>%
+  arrange(gene) %>%
+  as.data.frame()
+
+
+```
+
+``` {r assemble_data_frame}
+average_exp <- average_exp %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "gene")
+
+average_peaks <- average_peaks %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "peak")
+
+correlates_RNA <- macs2_links %>%
+  dplyr::select(gene, peak) %>%
+  dplyr::left_join(y = average_exp, by = "gene") %>%
+  tidyr::gather(key = "CellType", value = "avg_exp", -c(gene, peak))
+
+correlates_ATAC <- macs2_links %>%
+  dplyr::select(gene, peak) %>%
+  dplyr::left_join(y = average_peaks, by = "peak") %>%
+  tidyr::gather(key = "CellType", value = "avg_access", -c(gene, peak))
+
+correlates <- full_join(
+  x = correlates_RNA, 
+  y = correlates_ATAC,
+  by = c("gene", "peak", "CellType")
+) %>%
+  tidyr::drop_na() %>%
+  dplyr::filter(avg_exp != 0 & avg_access != 0)
+
+link_scores <- correlates %>%
+  dplyr::group_by(gene, peak) %>%
+  summarize(pearson = cor(log(avg_exp), log(avg_access)), reps = n()) %>%
+  dplyr::filter(reps > 5) %>%
+  dplyr::arrange(desc(abs(pearson)))
+
+specific_gene_data <- correlates %>%
+  dplyr::filter(gene == "CD247" & peak == "chr1-168509874-168510775")
+
+ggplot(data = specific_gene_data) +
+  geom_point(aes(x = log(avg_exp), y = log(avg_access))) +
+  xlab("Log(Average Gene Expression)") +
+  ylab("Log(Average peak accessibility)")
+
+#ggsave(filename = paste0(figure_path(),"middle_correlation.jpeg"), units = "in", width = 8, height = 6)
+
+hist(link_scores$pearson)
+
+```
+
+
+```{r plot_relationship}
+
+ggplot(data = correlates) +
+  geom_point(aes(x = log(avg_exp), y = log(avg_access))) +
+  xlab("Log(Average Gene Expression)") +
+  ylab("Log(Average peak accessibility)")
+
+ggsave(filename = paste0(figure_path(),"link_correlation.jpeg"), units = "in", width = 8, height = 6)
+
+
+ggplot(data = correlates) +
+  geom_density_2d(aes(x = log(avg_exp), y = log(avg_access))) +
+  xlab("Log(Average Gene Expression)") +
+  ylab("Log(Average peak accessibility)")
+
+ggsave(filename = paste0(figure_path(),"link_correlation_density_plot.jpeg"), units = "in", width = 8, height = 6)
+
+cor(log(correlates$avg_exp), (correlates$avg_access), method = "p")
+
+result <- lm(log(correlates$avg_exp)~log(correlates$avg_access))
+summary(result)
+
+```
+
+``` {r assemble_data_frame_overall}
+average_exp_overall <- average_exp_overall %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "gene")
+
+average_peaks_overall <- average_peaks_overall %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "peak")
+
+correlates_RNA_overall <- macs2_links %>%
+  dplyr::select(gene, peak) %>%
+  dplyr::left_join(y = average_exp_overall, by = "gene")  %>%
+  dplyr::rename(avg_exp = all)
+
+correlates_ATAC_overall <- macs2_links %>%
+  dplyr::select(gene, peak) %>%
+  dplyr::left_join(y = average_peaks_overall, by = "peak") %>%
+  dplyr::rename(avg_access = all)
+
+correlates_overall <- full_join(
+  x = correlates_RNA_overall, 
+  y = correlates_ATAC_overall,
+  by = c("gene", "peak")
+) %>%
+  tidyr::drop_na() %>%
+  dplyr::filter(avg_exp != 0 & avg_access != 0)
+
+```
+
+```{r plot_relationship}
+
+ggplot(data = correlates_overall) +
+  geom_point(aes(x = log(avg_exp), y = log(avg_access))) +
+  xlab("Log(Average Gene Expression)") +
+  ylab("Log(Average peak accessibility)")
+
+ggsave(filename = paste0(figure_path(),"link_correlation_overall.jpeg"), units = "in", width = 8, height = 6)
+
+
+ggplot(data = correlates_overall) +
+  geom_density_2d(aes(x = log(avg_exp), y = log(avg_access))) +
+  xlab("Log(Average Gene Expression)") +
+  ylab("Log(Average peak accessibility)")
+
+ggsave(filename = paste0(figure_path(),"link_correlation_density_plot_overall.jpeg"), units = "in", width = 8, height = 6)
+
+result <- lm(log(correlates_overall$avg_exp)~log(correlates_overall$avg_access))
+summary(result)
+
+```
+
+
+```{r misc}
+
+
+ggplot(data = link_scores) + 
+  geom_histogram(aes(x = pearson)) +
+  xlab("Pearson correlation of avg access and avg expression") +
+  ylab("Counts")
+
+ggsave(filename = paste0(figure_path(),"pearson_hist.jpeg"), units = "in", height = 6, width = 8)
+
+
+specific_gene_data <- correlates %>%
+  dplyr::filter(gene == "ZNF831" & peak == "chr20-59007795-59008503")
+
+ggplot(data = specific_gene_data) +
+  geom_point(aes(x = log(avg_exp), y = log(avg_access))) +
+  xlab("Log(Average Gene Expression)") +
+  ylab("Log(Average peak accessibility)")
+
+ggsave(filename = paste0(figure_path(),"repressor_example.jpeg"), units = "in", height = 6, width = 8)
+
+
+specific_gene_data <- correlates %>%
+  dplyr::filter(gene == "FAM151B" & peak == "chr5-80264188-80264659")
+
+ggplot(data = specific_gene_data) +
+  geom_point(aes(x = log(avg_exp), y = log(avg_access))) +
+  xlab("Log(Average Gene Expression)") +
+  ylab("Log(Average peak accessibility)")
+
+ggsave(filename = paste0(figure_path(),"activator_example.jpeg"), units = "in", height = 6, width = 8)
+
+
+
+scoring_relationships <- link_scores %>%
+  left_join(macs2_links, by = c("gene", "peak"))
+
+ggplot(data = scoring_relationships) +
+  geom_density_2d(aes(x = abs(pearson), y = -log10(pvalue))) +
+  xlab("Absolute value of 'validation' pearson r") +
+  ylab("-log10(link p-value)") +
+  ylim(c(0, 5))
+  
+ggsave(filename = paste0(figure_path(),"p_vs_external_pearson_trimmed_density.jpeg"), units = "in", height = 6, width = 8)
+
+ggplot(data = scoring_relationships) +
+  geom_point(aes(x = abs(pearson), y = width), shape = 1) +
+  xlab("Absolute value of 'validation' pearson r") +
+  ylab("Distance from TSS") 
+
+ggsave(filename = paste0(figure_path(),"pearson_vs_distance.jpeg"), units = "in", height = 6, width = 8)
+
+high_thresh_links <- scoring_relationships %>%
+  dplyr::filter(abs(pearson) >= 0.75)
+
+ggplot(data = high_thresh_links) + 
+  geom_histogram(aes(x = width), binwidth = 5000)
+
+low_thresh_links <- scoring_relationships %>%
+  dplyr::filter(abs(pearson) < 0.75)
+
+ggplot(data = low_thresh_links) + 
+  geom_histogram(aes(x = width), binwidth = 5000) 
+
+all_link_info <- macs2_links %>%
+  dplyr::group_by(gene) %>%
+  dplyr::mutate(num_links = dplyr::n()) %>%
+  dplyr::right_join(y = link_scores, by = c("gene", "peak"))
+
+ggplot(data = all_link_info) +
+  geom_point(aes(x = num_links, y = abs(pearson)), position = "jitter", shape = 1)
+ggsave(filename = paste0(figure_path(),"pearson_vs_num_peaks.jpeg"), units = "in", height = 6, width = 12)
+             
+```
+
+``` {r save_results}
+write.csv(
+  x = link_scores,
+  file = paste0(figure_path(), "link_external_correlations.csv"),
+  row.names = FALSE
+)
+
+```
+
+
+

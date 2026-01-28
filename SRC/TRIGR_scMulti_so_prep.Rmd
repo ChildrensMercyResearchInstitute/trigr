@@ -1,0 +1,1544 @@
+---
+title: "TRIGR single cell multiome Seurat object"
+output: html_document
+---
+
+```{r setup}
+
+# output directory path
+output_dir <- ".../TRIGR_scMulti_so_prep"
+# cellranger results directory (should contain subdirs for each scMulti library processed )
+cellranger_library_dir <- "..."
+
+library(dplyr)
+library(Seurat)
+library(Signac)
+library(sctransform)
+library(future)
+library(ggplot2)
+library(readr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(GenomicRanges)
+library(EnsDb.Hsapiens.v86)
+library(GenomeInfoDb)
+library(SingleCellExperiment)
+library(ExperimentHub)
+library(celldex)
+library(SeuratDisk)
+library(glmGamPoi)
+library(SingleR)
+
+
+#plan("multiprocess", workers=8)
+#options(
+#  future.globals.maxSize=75*1e9,
+#  future.seed = TRUE
+#)
+
+# Output folder for this document
+options(knitr.figure_dir = output_dir)
+
+source("knitr_common.r")
+```
+
+``` {r build_demuxlet_df}
+import_demux <- function(filename) {
+  read_tsv(filename, col_types=cols()) %>%
+    dplyr::select(barcode=BARCODE, droplet=DROPLET.TYPE, genotype=SNG.BEST.GUESS) %>%
+    dplyr::mutate(genotype = gsub("_2-.*\\.CEL$", "", genotype)) %>%
+    dplyr::mutate(genotype = gsub("^TRIGR_", "", genotype)) %>%
+    dplyr::mutate(barcode = substr(barcode, 1, 16))
+}
+
+demux_results_gex_list <- list.files(
+  path="../DATA/demuxlet_scMulti/01_scMulti_gex",
+  pattern=".*\\.best$",
+  full.names=TRUE
+)
+names(demux_results_gex_list) <- gsub("\\.best$", "", basename(demux_results_gex_list))
+
+demux_results_atac_list <- list.files(
+  path="../DATA/demuxlet_scMulti/02_scMulti_atac",
+  pattern=".*\\.best$",
+  full.names=TRUE
+)
+names(demux_results_atac_list) <- gsub("\\.best$", "", basename(demux_results_atac_list))
+
+demux_df_gex <- demux_results_gex_list %>%
+  lapply(import_demux) %>%
+  dplyr::bind_rows(.id="library") %>%
+  dplyr::mutate(barcode = paste(library, barcode, sep = "_")) %>%
+  dplyr::select(-library) %>%
+  data.frame()
+
+demux_df_atac <- demux_results_atac_list %>%
+  lapply(import_demux) %>%
+  dplyr::bind_rows(.id="library") %>%
+  dplyr::mutate(barcode = paste(library, barcode, sep = "_")) %>%
+  dplyr::select(-library) %>%
+  data.frame()
+
+```
+
+``` {r make_peaks_list}
+#use_cellranger_peaks <- FALSE
+
+  combined.peaks <- faster_readRDS(
+    paste(
+    "..",
+    "DATA",
+    "blood_peaks.rds",
+    sep = "/"
+  )
+  )
+
+```
+
+``` {r get_experiment_info}
+samples_info <- read.csv(
+  paste(
+    "..",
+    "DATA",
+    "sample_info_multiome.csv",
+    sep = "/"
+  )
+)
+samples_info$genotype_ID <- as.character(samples_info$genotype_ID)
+samples_info$sample <- substr(samples_info$pool, 1, 16)
+```
+
+```{r import_and_build_so}
+lib_list <- read.csv("../DATA/multiome_libraries.csv")
+
+project_name  <- "TRIGR"
+
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+seqlevelsStyle(annotations) <- "UCSC"
+genome(annotations) <- "GRCh38"
+
+for (sample in unique(lib_list$sample)) {
+  sample_info <- lib_list[lib_list$sample == sample,]
+  capture_list <- c()
+  for (capture in sort(sample_info$capture)) {
+    library_name <- sample_info[sample_info$capture == capture, "library"]
+    matrix_file <- paste(
+      cellranger_library_dir,
+      library_name,
+      "outs",
+      "filtered_feature_bc_matrix.h5",
+      sep = "/"
+    )
+    atac_fragments_file <- paste(
+      cellranger_library_dir,
+      library_name,
+      "outs",
+      "atac_fragments.tsv.gz",
+      sep = "/"
+    )
+    data_matrix <- Read10X_h5(matrix_file)
+    so <- CreateSeuratObject(
+      data_matrix$`Gene Expression`,
+      project = project_name,
+      assay = "RNA"
+    )
+    atac_fragments <- CreateFragmentObject(
+      atac_fragments_file,
+      cells = rownames(so@meta.data)
+    )
+    atac.counts <- FeatureMatrix(
+      fragments = atac_fragments,
+      features = combined.peaks,
+      cells = rownames(so@meta.data)
+    )
+    atac_data <- CreateChromatinAssay(
+      counts = atac.counts,
+      min.cells = 50,
+      sep = c(":", "-"),
+      genome = "GRCh38"
+    )
+    Annotation(atac_data) <- annotations
+    Fragments(atac_data) <- atac_fragments
+    so[["ATAC"]] <- atac_data
+    DefaultAssay(so) <- "ATAC"
+    so <- TSSEnrichment(so, fast = FALSE)
+    so <- NucleosomeSignal(so)
+    fragment_counts <- CountFragments(
+      fragments = atac_fragments_file,
+      cells = rownames(so@meta.data)
+    )
+    so$total_fragments <- data.frame(
+      fragment_counts$frequency_count,
+      row.names = fragment_counts$CB
+    )
+    so <- FRiP(
+      object = so,
+      assay = "ATAC",
+      total.fragments = 'total_fragments'
+    )
+    so$peak_region_fragments <- so$total_fragments * so$FRiP
+    so$blacklist_fraction <- FractionCountsInRegion(
+      object = so,
+      assay = "ATAC",
+      regions = blacklist_hg38
+    )
+    so[["sample_type"]] <- sample_info[sample_info$capture == capture, "source"]
+    so[["assay_type"]] <- sample_info[sample_info$capture == capture, "assay_type"]
+    so[["individual"]] <- "N/A"
+    so[["sample"]] <- sample
+    so[["capture"]] <- capture
+    so[["library"]] <- library_name
+    DefaultAssay(so) <- "RNA"
+    so$percent_mt <- PercentageFeatureSet(
+      so,
+      pattern = "^MT-"
+    )
+    so$percent_ribo <- PercentageFeatureSet(
+      so,
+      pattern="^RP[SL]"
+    )
+    so$barcode <- substring(
+      rownames(so@meta.data),
+      1,
+      16
+    )
+    so <- RenameCells(
+      so,
+      new.names = paste(
+        so$library,
+        so$barcode,
+        sep = "_"
+      )
+    )
+    so$droplet_type_gex <- data.frame(
+      demux_df_gex$droplet,
+      row.names = demux_df_gex$barcode
+    )
+    so$droplet_type_atac <- data.frame(
+      demux_df_atac$droplet,
+      row.names = demux_df_atac$barcode
+    )
+    so$genotype_ID <- data.frame(
+      demux_df_gex$genotype,
+      row.names = demux_df_gex$barcode
+    )
+    so$genotype_ID_ATAC <- data.frame(
+      demux_df_atac$genotype,
+      row.names = demux_df_atac$barcode
+    )
+    no_demux_results <- rownames(so@meta.data)[is.na(so@meta.data$genotype_ID)]
+    so <- subset(so, cells = no_demux_results, invert = TRUE)
+    meta <- so@meta.data
+    meta <- left_join(meta, samples_info, by = c("genotype_ID", "sample"))
+    rownames(meta) <- rownames(so@meta.data)
+    so@meta.data <- meta
+    capture_list <- c(capture_list, so)
+  }
+  so_by_sample <- merge(
+    capture_list[[1]],
+    capture_list[2:length(capture_list)]
+  )
+  faster_saveRDS(
+    so_by_sample,
+    paste0(
+      figure_path(),
+      sample,
+      "_merged_raw_so.rds"
+    )
+  )
+}
+```
+
+```{r normalize_data, fig.height = 10, fig.width = 12}
+
+so_list <- c(
+  faster_readRDS(paste0(figure_path(), "10x_scPool_00078_merged_raw_so.rds")),
+  faster_readRDS(paste0(figure_path(), "10x_scPool_00079_merged_raw_so.rds")),
+  faster_readRDS(paste0(figure_path(), "10x_TRIGRpool_03_merged_raw_so.rds")),
+  faster_readRDS(paste0(figure_path(), "10x_TRIGRpool_04_merged_raw_so.rds")),
+  faster_readRDS(paste0(figure_path(), "10x_TRIGRpool_05_merged_raw_so.rds")),
+  faster_readRDS(paste0(figure_path(), "10x_TRIGRpool_06_merged_raw_so.rds"))
+)
+
+for (i in seq_len(length(so_list))) {
+  print(
+    VlnPlot(
+      so_list[[i]],
+      group.by = "capture",
+      features = c(
+        "nCount_RNA",
+        "nFeature_RNA",
+        "FRiP",
+        "blacklist_fraction",
+        "nucleosome_signal",
+        "peak_region_fragments",
+        "TSS.enrichment",
+        "percent_mt",
+        "percent_ribo"
+      ),
+      log = TRUE
+    )
+  )
+}
+
+so_list_normalized <- cache(
+  "so_list_normalized",
+  function() {
+    for (i in seq_len(length(so_list))) {
+      so_list[[i]] <- subset(
+        so_list[[i]],
+        subset = droplet_type_atac != "DBL" &
+        droplet_type_gex != "DBL" &
+        FRiP > 0.02 &
+        blacklist_fraction < 0.04 &
+        peak_region_fragments > 150 &
+        nucleosome_signal < 3 &
+        TSS.enrichment > 2 &
+        nCount_RNA > 750 &
+        percent_mt < 40
+      )
+      DefaultAssay(so_list[[i]]) <- "RNA"
+      so_list[[i]] <- SCTransform(
+        so_list[[i]],
+        return.only.var.genes = FALSE,
+        batch_var = "capture",
+        method = "glmGamPoi"
+      )
+      DefaultAssay(so_list[[i]]) <- "ATAC"
+      so_list[[i]] <- RunTFIDF(so_list[[i]])
+      so_list[[i]] <- FindTopFeatures(
+        so_list[[i]],
+        min.cutoff = "q25"
+      )
+      so_list[[i]] <- RunSVD(so_list[[i]])
+    }
+    return(so_list)
+  }
+)
+
+so_list_normalized_no_batch <- cache(
+  "so_list_normalized_no_batch_var",
+  function() {
+    for (i in seq_len(length(so_list))) {
+      so_list[[i]] <- subset(
+        so_list[[i]],
+        subset = droplet_type_atac != "DBL" &
+        droplet_type_gex != "DBL" &
+        FRiP > 0.02 &
+        blacklist_fraction < 0.04 &
+        peak_region_fragments > 150 &
+        nucleosome_signal < 3 &
+        TSS.enrichment > 2 &
+        nCount_RNA > 750 &
+        percent_mt < 40
+      )
+      DefaultAssay(so_list[[i]]) <- "RNA"
+      so_list[[i]] <- SCTransform(
+        so_list[[i]],
+        return.only.var.genes = FALSE,
+        method = "glmGamPoi"
+      )
+      DefaultAssay(so_list[[i]]) <- "ATAC"
+      so_list[[i]] <- RunTFIDF(so_list[[i]])
+      so_list[[i]] <- FindTopFeatures(
+        so_list[[i]],
+        min.cutoff = "q25"
+      )
+      so_list[[i]] <- RunSVD(so_list[[i]])
+    }
+    return(so_list)
+  }
+)
+```
+
+```{r integration_and_wnn_finding}
+so <- cache(
+  "so_integrated",
+  function() {
+    for (i in seq_len(length(so_list_normalized))) {
+      DefaultAssay(so_list_normalized[[i]]) <- "SCT"
+    }
+    features <- SelectIntegrationFeatures(so_list_normalized, nfeatures = 3000)
+    so_list_normalized <- PrepSCTIntegration(
+      so_list_normalized,
+      anchor.features = features
+    )
+    so_list_normalized <- lapply(
+      X = so_list_normalized,
+      FUN = RunPCA,
+      features = features,
+      verbose = FALSE
+    )
+    integration_anchors <- FindIntegrationAnchors(
+      object.list = so_list_normalized,
+      normalization.method = "SCT",
+      anchor.features = features,
+      dims = 1:30,
+      reduction = "rpca",
+      k.anchor = 20,
+      reference = 4
+    )
+    so <- IntegrateData(
+      anchorset = integration_anchors,
+      normalization.method = "SCT",
+      new.assay.name = "integratedRNA",
+      dims = 1:30
+    )
+    DefaultAssay(so) <- "ATAC"
+    so <- RunTFIDF(so)
+    so <- FindTopFeatures(so, min.cutoff = "q25")
+    so <- RunSVD(so)
+    so_atac <- IntegrateEmbeddings(
+      anchorset = integration_anchors,
+      new.reduction.name = "integratedLSI",
+      reductions = so@reductions$lsi
+    )
+    so@reductions$integratedLSI <- so_atac@reductions$integratedLSI
+    DefaultAssay(so) <- "integratedRNA"
+    so <- RunPCA(
+      so,
+      verbose = FALSE,
+      npcs = 100,
+      reduction.name = "integratedPCA",
+      assay = "integratedRNA"
+    )
+    so <- FindMultiModalNeighbors(
+      so,
+      reduction.list = list("integratedPCA", "integratedLSI"),
+      dims.list = list(1:30, 2:30)
+    )
+    return(so)
+  }
+)
+
+so <- cache(
+  "so_integrated_no_batch_var",
+  function() {
+    for (i in seq_len(length(so_list_normalized_no_batch))) {
+      DefaultAssay(so_list_normalized_no_batch[[i]]) <- "SCT"
+    }
+    features <- SelectIntegrationFeatures(so_list_normalized_no_batch, nfeatures = 3000)
+    so_list_normalized_no_batch <- PrepSCTIntegration(
+      so_list_normalized_no_batch,
+      anchor.features = features
+    )
+    so_list_normalized_no_batch <- lapply(
+      X = so_list_normalized_no_batch,
+      FUN = RunPCA,
+      features = features,
+      verbose = FALSE
+    )
+    integration_anchors <- FindIntegrationAnchors(
+      object.list = so_list_normalized_no_batch,
+      normalization.method = "SCT",
+      anchor.features = features,
+      dims = 1:30,
+      reduction = "rpca",
+      k.anchor = 20,
+    )
+    so <- IntegrateData(
+      anchorset = integration_anchors,
+      normalization.method = "SCT",
+      new.assay.name = "integratedRNA",
+      dims = 1:30
+    )
+    DefaultAssay(so) <- "ATAC"
+    so <- RunTFIDF(so)
+    so <- FindTopFeatures(so, min.cutoff = "q25")
+    so <- RunSVD(so)
+    so_atac <- IntegrateEmbeddings(
+      anchorset = integration_anchors,
+      new.reduction.name = "integratedLSI",
+      reductions = so@reductions$lsi
+    )
+    so@reductions$integratedLSI <- so_atac@reductions$integratedLSI
+    DefaultAssay(so) <- "integratedRNA"
+    so <- RunPCA(
+      so,
+      verbose = FALSE,
+      npcs = 100,
+      reduction.name = "integratedPCA",
+      assay = "integratedRNA"
+    )
+    so <- FindMultiModalNeighbors(
+      so,
+      reduction.list = list("integratedPCA", "integratedLSI"),
+      dims.list = list(1:30, 2:30)
+    )
+    return(so)
+  }
+)
+
+
+so_tp1 <- cache(
+  "so_integrated_no_batch_var_tp1",
+  function() {
+    so_list_normalized_no_batch_subset <- so_list_normalized_no_batch[c(1,4)]
+    for (i in seq_len(length(so_list_normalized_no_batch_subset))) {
+      DefaultAssay(so_list_normalized_no_batch_subset[[i]]) <- "SCT"
+    }
+    features <- SelectIntegrationFeatures(so_list_normalized_no_batch_subset, nfeatures = 3000)
+    so_list_normalized_no_batch_subset <- PrepSCTIntegration(
+      so_list_normalized_no_batch_subset,
+      anchor.features = features
+    )
+    so_list_normalized_no_batch_subset <- lapply(
+      X = so_list_normalized_no_batch_subset,
+      FUN = RunPCA,
+      features = features,
+      verbose = FALSE
+    )
+    integration_anchors <- FindIntegrationAnchors(
+      object.list = so_list_normalized_no_batch_subset,
+      normalization.method = "SCT",
+      anchor.features = features,
+      dims = 1:30,
+      reduction = "rpca",
+      k.anchor = 20
+    )
+    so <- IntegrateData(
+      anchorset = integration_anchors,
+      normalization.method = "SCT",
+      new.assay.name = "integratedRNA",
+      dims = 1:30
+    )
+    DefaultAssay(so) <- "ATAC"
+    so <- RunTFIDF(so)
+    so <- FindTopFeatures(so, min.cutoff = "q25")
+    so <- RunSVD(so)
+    so_atac <- IntegrateEmbeddings(
+      anchorset = integration_anchors,
+      new.reduction.name = "integratedLSI",
+      reductions = so@reductions$lsi
+    )
+    so@reductions$integratedLSI <- so_atac@reductions$integratedLSI
+    DefaultAssay(so) <- "integratedRNA"
+    so <- RunPCA(
+      so,
+      verbose = FALSE,
+      npcs = 100,
+      reduction.name = "integratedPCA",
+      assay = "integratedRNA"
+    )
+    so <- FindMultiModalNeighbors(
+      so,
+      reduction.list = list("integratedPCA", "integratedLSI"),
+      dims.list = list(1:30, 2:30)
+    )
+    return(so)
+  }
+)
+
+so_tp2 <- cache(
+  "so_integrated_no_batch_var_tp2",
+  function() {
+    so_list_normalized_no_batch_subset <- so_list_normalized_no_batch[c(2,5)]
+    for (i in seq_len(length(so_list_normalized_no_batch_subset))) {
+      DefaultAssay(so_list_normalized_no_batch_subset[[i]]) <- "SCT"
+    }
+    features <- SelectIntegrationFeatures(so_list_normalized_no_batch_subset, nfeatures = 3000)
+    so_list_normalized_no_batch_subset <- PrepSCTIntegration(
+      so_list_normalized_no_batch_subset,
+      anchor.features = features
+    )
+    so_list_normalized_no_batch_subset <- lapply(
+      X = so_list_normalized_no_batch_subset,
+      FUN = RunPCA,
+      features = features,
+      verbose = FALSE
+    )
+    integration_anchors <- FindIntegrationAnchors(
+      object.list = so_list_normalized_no_batch_subset,
+      normalization.method = "SCT",
+      anchor.features = features,
+      dims = 1:30,
+      reduction = "rpca",
+      k.anchor = 20
+    )
+    so <- IntegrateData(
+      anchorset = integration_anchors,
+      normalization.method = "SCT",
+      new.assay.name = "integratedRNA",
+      dims = 1:30
+    )
+    DefaultAssay(so) <- "ATAC"
+    so <- RunTFIDF(so)
+    so <- FindTopFeatures(so, min.cutoff = "q25")
+    so <- RunSVD(so)
+    so_atac <- IntegrateEmbeddings(
+      anchorset = integration_anchors,
+      new.reduction.name = "integratedLSI",
+      reductions = so@reductions$lsi
+    )
+    so@reductions$integratedLSI <- so_atac@reductions$integratedLSI
+    DefaultAssay(so) <- "integratedRNA"
+    so <- RunPCA(
+      so,
+      verbose = FALSE,
+      npcs = 100,
+      reduction.name = "integratedPCA",
+      assay = "integratedRNA"
+    )
+    so <- FindMultiModalNeighbors(
+      so,
+      reduction.list = list("integratedPCA", "integratedLSI"),
+      dims.list = list(1:30, 2:30)
+    )
+    return(so)
+  }
+)
+
+so_tp3 <- cache(
+  "so_integrated_no_batch_var_tp3",
+  function() {
+    so_list_normalized_no_batch_subset <- so_list_normalized_no_batch[c(3,6)]
+    for (i in seq_len(length(so_list_normalized_no_batch_subset))) {
+      DefaultAssay(so_list_normalized_no_batch_subset[[i]]) <- "SCT"
+    }
+    features <- SelectIntegrationFeatures(so_list_normalized_no_batch_subset, nfeatures = 3000)
+    so_list_normalized_no_batch_subset <- PrepSCTIntegration(
+      so_list_normalized_no_batch_subset,
+      anchor.features = features
+    )
+    so_list_normalized_no_batch_subset <- lapply(
+      X = so_list_normalized_no_batch_subset,
+      FUN = RunPCA,
+      features = features,
+      verbose = FALSE
+    )
+    integration_anchors <- FindIntegrationAnchors(
+      object.list = so_list_normalized_no_batch_subset,
+      normalization.method = "SCT",
+      anchor.features = features,
+      dims = 1:30,
+      reduction = "rpca",
+      k.anchor = 20
+    )
+    so <- IntegrateData(
+      anchorset = integration_anchors,
+      normalization.method = "SCT",
+      new.assay.name = "integratedRNA",
+      dims = 1:30
+    )
+    DefaultAssay(so) <- "ATAC"
+    so <- RunTFIDF(so)
+    so <- FindTopFeatures(so, min.cutoff = "q25")
+    so <- RunSVD(so)
+    so_atac <- IntegrateEmbeddings(
+      anchorset = integration_anchors,
+      new.reduction.name = "integratedLSI",
+      reductions = so@reductions$lsi
+    )
+    so@reductions$integratedLSI <- so_atac@reductions$integratedLSI
+    DefaultAssay(so) <- "integratedRNA"
+    so <- RunPCA(
+      so,
+      verbose = FALSE,
+      npcs = 100,
+      reduction.name = "integratedPCA",
+      assay = "integratedRNA"
+    )
+    so <- FindMultiModalNeighbors(
+      so,
+      reduction.list = list("integratedPCA", "integratedLSI"),
+      dims.list = list(1:30, 2:30)
+    )
+    return(so)
+  }
+)
+
+```
+
+``` {r clustering}
+
+so <- RunUMAP(
+  so,
+  reduction = 'integratedLSI',
+  dims = 2:30,
+  reduction.name = "umap.atac",
+  reduction.key = "atacUMAP_"
+)
+so <- RunUMAP(
+  so,
+  nn.name = "weighted.nn",
+  reduction.name = "umap.wnn",
+  reduction.key = "wnnUMAP_"
+)
+so <- RunUMAP(
+  so,
+  dims = 1:30,
+  reduction.name = "umap.rna",
+  reduction.key = "rnaUMAP_",
+  reduction = "integratedPCA"
+)
+
+so <- FindClusters(
+  so,
+  graph.name = "wsnn",
+  algorithm = 3
+)
+
+# do clustering for merged_tp1
+so_tp1 <- RunUMAP(
+  so_tp1,
+  reduction = 'integratedLSI',
+  dims = 2:30,
+  reduction.name = "umap.atac",
+  reduction.key = "atacUMAP_"
+)
+so_tp1 <- RunUMAP(
+  so_tp1,
+  nn.name = "weighted.nn",
+  reduction.name = "umap.wnn",
+  reduction.key = "wnnUMAP_"
+)
+so_tp1 <- RunUMAP(
+  so_tp1,
+  dims = 1:30,
+  reduction.name = "umap.rna",
+  reduction.key = "rnaUMAP_",
+  reduction = "integratedPCA"
+)
+
+so_tp1 <- FindClusters(
+  so_tp1,
+  graph.name = "wsnn",
+  algorithm = 3
+)
+
+# do clustering for merged_tp2
+so_tp2 <- RunUMAP(
+  so_tp2,
+  reduction = 'integratedLSI',
+  dims = 2:30,
+  reduction.name = "umap.atac",
+  reduction.key = "atacUMAP_"
+)
+so_tp2 <- RunUMAP(
+  so_tp2,
+  nn.name = "weighted.nn",
+  reduction.name = "umap.wnn",
+  reduction.key = "wnnUMAP_"
+)
+so_tp2 <- RunUMAP(
+  so_tp2,
+  dims = 1:30,
+  reduction.name = "umap.rna",
+  reduction.key = "rnaUMAP_",
+  reduction = "integratedPCA"
+)
+
+so_tp2 <- FindClusters(
+  so_tp2,
+  graph.name = "wsnn",
+  algorithm = 3
+)
+
+# do clustering for merged_tp3
+so_tp3 <- RunUMAP(
+  so_tp3,
+  reduction = 'integratedLSI',
+  dims = 2:30,
+  reduction.name = "umap.atac",
+  reduction.key = "atacUMAP_"
+)
+so_tp3 <- RunUMAP(
+  so_tp3,
+  nn.name = "weighted.nn",
+  reduction.name = "umap.wnn",
+  reduction.key = "wnnUMAP_"
+)
+so_tp3 <- RunUMAP(
+  so_tp3,
+  dims = 1:30,
+  reduction.name = "umap.rna",
+  reduction.key = "rnaUMAP_",
+  reduction = "integratedPCA"
+)
+
+so_tp3 <- FindClusters(
+  so_tp3,
+  graph.name = "wsnn",
+  algorithm = 3
+)
+
+```
+
+``` {r assign_cells_singleR}
+hpca.se <- celldex::HumanPrimaryCellAtlasData()
+encode.se <- celldex::BlueprintEncodeData()
+
+Idents(so) <- "wsnn_res.0.8"
+DefaultAssay(so) <- "SCT"
+
+single_cell_experiment_object <- as.SingleCellExperiment(so)
+predicted_cell_types_HPCA <- SingleR(
+  single_cell_experiment_object,
+  ref = hpca.se,
+  labels = hpca.se$label.main
+)
+predicted_cell_types_ENCODE <- SingleR(
+  single_cell_experiment_object,
+  ref = encode.se,
+  labels = encode.se$label.main
+)
+so$SingleR_labels_HPCA <- predicted_cell_types_HPCA$labels
+so$SingleR_labels_ENCODE <- predicted_cell_types_ENCODE$labels
+
+# do for merged_tp1
+Idents(so_tp1) <- "wsnn_res.0.8"
+DefaultAssay(so_tp1) <- "SCT"
+
+single_cell_experiment_object <- as.SingleCellExperiment(so_tp1)
+predicted_cell_types_HPCA <- SingleR(
+  single_cell_experiment_object,
+  ref = hpca.se,
+  labels = hpca.se$label.main
+)
+predicted_cell_types_ENCODE <- SingleR(
+  single_cell_experiment_object,
+  ref = encode.se,
+  labels = encode.se$label.main
+)
+so_tp1$SingleR_labels_HPCA <- predicted_cell_types_HPCA$labels
+so_tp1$SingleR_labels_ENCODE <- predicted_cell_types_ENCODE$labels
+
+# do for merged_tp2
+Idents(so_tp2) <- "wsnn_res.0.8"
+DefaultAssay(so_tp2) <- "SCT"
+
+single_cell_experiment_object <- as.SingleCellExperiment(so_tp2)
+predicted_cell_types_HPCA <- SingleR(
+  single_cell_experiment_object,
+  ref = hpca.se,
+  labels = hpca.se$label.main
+)
+predicted_cell_types_ENCODE <- SingleR(
+  single_cell_experiment_object,
+  ref = encode.se,
+  labels = encode.se$label.main
+)
+so_tp2$SingleR_labels_HPCA <- predicted_cell_types_HPCA$labels
+so_tp2$SingleR_labels_ENCODE <- predicted_cell_types_ENCODE$labels
+
+# do for merged_tp3
+Idents(so_tp3) <- "wsnn_res.0.8"
+DefaultAssay(so_tp3) <- "SCT"
+
+single_cell_experiment_object <- as.SingleCellExperiment(so_tp3)
+predicted_cell_types_HPCA <- SingleR(
+  single_cell_experiment_object,
+  ref = hpca.se,
+  labels = hpca.se$label.main
+)
+predicted_cell_types_ENCODE <- SingleR(
+  single_cell_experiment_object,
+  ref = encode.se,
+  labels = encode.se$label.main
+)
+so_tp3$SingleR_labels_HPCA <- predicted_cell_types_HPCA$labels
+so_tp3$SingleR_labels_ENCODE <- predicted_cell_types_ENCODE$labels
+```
+
+``` {r assign_cells_CITE_seq}
+CITE_seq_data <- LoadH5Seurat(
+  paste(
+    "/home",
+    "kwinkley",
+    "04_data_references",
+    "pbmc_multimodal.h5seurat",
+    sep = "/"
+  )
+)
+
+anchors <- FindTransferAnchors(
+  reference = CITE_seq_data,
+  query = so,
+  normalization.method = "SCT",
+  reference.reduction = "spca",
+  dims = 1:50,
+  reference.assay = "SCT",
+  query.assay = "SCT"
+)
+
+so <- MapQuery(
+  anchorset = anchors,
+  query = so,
+  reference = CITE_seq_data,
+  refdata = list(
+    celltype_coarse = "celltype.l1",
+    celltype_fine = "celltype.l2",
+    predicted_ADT = "ADT"
+  ),
+  reference.reduction = "spca",
+  reduction.model = "wnn.umap"
+)
+
+# do for merged_tp1
+anchors_tp1 <- FindTransferAnchors(
+  reference = CITE_seq_data,
+  query = so_tp1,
+  normalization.method = "SCT",
+  reference.reduction = "spca",
+  dims = 1:50,
+  reference.assay = "SCT",
+  query.assay = "SCT"
+)
+
+so_tp1 <- MapQuery(
+  anchorset = anchors_tp1,
+  query = so_tp1,
+  reference = CITE_seq_data,
+  refdata = list(
+    celltype_coarse = "celltype.l1",
+    celltype_fine = "celltype.l2",
+    predicted_ADT = "ADT"
+  ),
+  reference.reduction = "spca",
+  reduction.model = "wnn.umap"
+)
+
+# do for merged_tp2
+anchors_tp2 <- FindTransferAnchors(
+  reference = CITE_seq_data,
+  query = so_tp2,
+  normalization.method = "SCT",
+  reference.reduction = "spca",
+  dims = 1:50,
+  reference.assay = "SCT",
+  query.assay = "SCT"
+)
+
+so_tp2 <- MapQuery(
+  anchorset = anchors_tp2,
+  query = so_tp2,
+  reference = CITE_seq_data,
+  refdata = list(
+    celltype_coarse = "celltype.l1",
+    celltype_fine = "celltype.l2",
+    predicted_ADT = "ADT"
+  ),
+  reference.reduction = "spca",
+  reduction.model = "wnn.umap"
+)
+
+# do for merged_tp3
+anchors_tp3<- FindTransferAnchors(
+  reference = CITE_seq_data,
+  query = so_tp3,
+  normalization.method = "SCT",
+  reference.reduction = "spca",
+  dims = 1:50,
+  reference.assay = "SCT",
+  query.assay = "SCT"
+)
+
+so_tp3 <- MapQuery(
+  anchorset = anchors_tp3,
+  query = so_tp3,
+  reference = CITE_seq_data,
+  refdata = list(
+    celltype_coarse = "celltype.l1",
+    celltype_fine = "celltype.l2",
+    predicted_ADT = "ADT"
+  ),
+  reference.reduction = "spca",
+  reduction.model = "wnn.umap"
+)
+
+```
+
+```{r call_and_quant_Mac2_peaks}
+DefaultAssay(so) <- "ATAC"
+macs2_peaks <- CallPeaks(
+  object = so,
+  macs2.path = "/home/kwinkley/.conda/envs/macs2_env/bin/macs2"
+)
+macs2_peaks <- keepStandardChromosomes(
+  macs2_peaks,
+  pruning.mode = 'tidy'
+)
+macs2_peaks_counts <- FeatureMatrix(
+  fragments = Fragments(so),
+  features = macs2_peaks,
+  cells = colnames(so)
+)
+so[['macs2Peaks']] <- CreateChromatinAssay(
+  counts = macs2_peaks_counts,
+  min.cells = 1,
+  ranges = macs2_peaks,
+  genome = 'GRCh38'
+)
+Annotation(so@assays$macs2Peaks) <- annotations
+DefaultAssay(so) <- 'macs2Peaks'
+so <- RunTFIDF(so)
+
+#now do for timepoint 1
+DefaultAssay(so_tp1) <- "ATAC"
+macs2_peaks_tp1 <- CallPeaks(
+  object = so_tp1,
+  macs2.path = "/home/kwinkley/.conda/envs/macs2_env/bin/macs2"
+)
+macs2_peaks_tp1 <- keepStandardChromosomes(
+  macs2_peaks_tp1,
+  pruning.mode = 'tidy'
+)
+macs2_peaks_counts_tp1 <- FeatureMatrix(
+  fragments = Fragments(so_tp1),
+  features = macs2_peaks_tp1,
+  cells = colnames(so_tp1)
+)
+so_tp1[['macs2Peaks']] <- CreateChromatinAssay(
+  counts = macs2_peaks_counts_tp1,
+  min.cells = 1,
+  ranges = macs2_peaks_tp1,
+  genome = 'GRCh38'
+)
+Annotation(so_tp1@assays$macs2Peaks) <- annotations
+DefaultAssay(so_tp1) <- 'macs2Peaks'
+so_tp1 <- RunTFIDF(so_tp1)
+
+#now do for timepoint 2
+DefaultAssay(so_tp2) <- "ATAC"
+macs2_peaks_tp2 <- CallPeaks(
+  object = so_tp2,
+  macs2.path = "/home/kwinkley/.conda/envs/macs2_env/bin/macs2"
+)
+macs2_peaks_tp2 <- keepStandardChromosomes(
+  macs2_peaks_tp2,
+  pruning.mode = 'tidy'
+)
+macs2_peaks_counts_tp2 <- FeatureMatrix(
+  fragments = Fragments(so_tp2),
+  features = macs2_peaks_tp2,
+  cells = colnames(so_tp2)
+)
+so_tp2[['macs2Peaks']] <- CreateChromatinAssay(
+  counts = macs2_peaks_counts_tp2,
+  min.cells = 1,
+  ranges = macs2_peaks_tp2,
+  genome = 'GRCh38'
+)
+Annotation(so_tp2@assays$macs2Peaks) <- annotations
+DefaultAssay(so_tp2) <- 'macs2Peaks'
+so_tp2 <- RunTFIDF(so_tp2)
+
+#now do for timepoint 3
+DefaultAssay(so_tp3) <- "ATAC"
+macs2_peaks_tp3 <- CallPeaks(
+  object = so_tp3,
+  macs2.path = "/home/kwinkley/.conda/envs/macs2_env/bin/macs2"
+)
+macs2_peaks_tp3 <- keepStandardChromosomes(
+  macs2_peaks_tp3,
+  pruning.mode = 'tidy'
+)
+macs2_peaks_counts_tp3 <- FeatureMatrix(
+  fragments = Fragments(so_tp3),
+  features = macs2_peaks_tp3,
+  cells = colnames(so_tp3)
+)
+so_tp3[['macs2Peaks']] <- CreateChromatinAssay(
+  counts = macs2_peaks_counts_tp3,
+  min.cells = 1,
+  ranges = macs2_peaks_tp3,
+  genome = 'GRCh38'
+)
+Annotation(so_tp3@assays$macs2Peaks) <- annotations
+DefaultAssay(so_tp3) <- 'macs2Peaks'
+so_tp3 <- RunTFIDF(so_tp3)
+```
+
+```{r link_peaks_to_genes}
+so <- RegionStats(
+  object = so,
+  assay = "ATAC",
+  genome = BSgenome.Hsapiens.UCSC.hg38,
+  verbose = TRUE
+)
+so <- LinkPeaks(
+  object = so,
+  peak.assay = "ATAC",
+  expression.assay = "SCT",
+  distance = 1e+06
+)
+so <- RegionStats(
+  object = so,
+  assay = "macs2Peaks",
+  genome = BSgenome.Hsapiens.UCSC.hg38,
+  verbose = TRUE
+)
+so <- LinkPeaks(
+  object = so,
+  peak.assay = "macs2Peaks",
+  expression.assay = "SCT",
+  distance = 1e+06
+)
+
+#now do for tp1
+so_tp1 <- RegionStats(
+  object = so_tp1,
+  assay = "ATAC",
+  genome = BSgenome.Hsapiens.UCSC.hg38,
+  verbose = TRUE
+)
+so_tp1 <- LinkPeaks(
+  object = so_tp1,
+  peak.assay = "ATAC",
+  expression.assay = "SCT",
+  distance = 1e+06
+)
+so_tp1 <- RegionStats(
+  object = so_tp1,
+  assay = "macs2Peaks",
+  genome = BSgenome.Hsapiens.UCSC.hg38,
+  verbose = TRUE
+)
+so_tp1 <- LinkPeaks(
+  object = so_tp1,
+  peak.assay = "macs2Peaks",
+  expression.assay = "SCT",
+  distance = 1e+06
+)
+
+#now do for tp2
+so_tp2 <- RegionStats(
+  object = so_tp2,
+  assay = "ATAC",
+  genome = BSgenome.Hsapiens.UCSC.hg38,
+  verbose = TRUE
+)
+so_tp2 <- LinkPeaks(
+  object = so_tp2,
+  peak.assay = "ATAC",
+  expression.assay = "SCT",
+  distance = 1e+06
+)
+so_tp2 <- RegionStats(
+  object = so_tp2,
+  assay = "macs2Peaks",
+  genome = BSgenome.Hsapiens.UCSC.hg38,
+  verbose = TRUE
+)
+so_tp2 <- LinkPeaks(
+  object = so_tp2,
+  peak.assay = "macs2Peaks",
+  expression.assay = "SCT",
+  distance = 1e+06
+)
+
+#now do for tp3
+so_tp3 <- RegionStats(
+  object = so_tp3,
+  assay = "ATAC",
+  genome = BSgenome.Hsapiens.UCSC.hg38,
+  verbose = TRUE
+)
+so_tp3 <- LinkPeaks(
+  object = so_tp3,
+  peak.assay = "ATAC",
+  expression.assay = "SCT",
+  distance = 1e+06
+)
+so_tp3 <- RegionStats(
+  object = so_tp3,
+  assay = "macs2Peaks",
+  genome = BSgenome.Hsapiens.UCSC.hg38,
+  verbose = TRUE
+)
+so_tp3 <- LinkPeaks(
+  object = so_tp3,
+  peak.assay = "macs2Peaks",
+  expression.assay = "SCT",
+  distance = 1e+06
+)
+```
+
+```{r call_and_quant_Mac3_peaks}
+DefaultAssay(so) <- "ATAC"
+macs3_peaks <- CallPeaks(
+  object = so,
+  macs2.path = "/home/kwinkley/.conda/envs/macs3_env/bin/macs3"
+)
+
+macs3_peaks <- keepStandardChromosomes(
+  macs3_peaks,
+  pruning.mode = 'tidy'
+)
+
+macs3_peaks_counts <- FeatureMatrix(
+  fragments = Fragments(so),
+  features = macs3_peaks,
+  cells = colnames(so)
+)
+
+so[['macs3Peaks']] <- CreateChromatinAssay(
+  counts = macs3_peaks_counts,
+  min.cells = 1,
+  ranges = macs3_peaks,
+  genome = 'GRCh38'
+)
+
+Annotation(so@assays$macs3Peaks) <- annotations
+DefaultAssay(so) <- 'macs3Peaks'
+so <- RunTFIDF(so)
+
+
+so <- RegionStats(
+  object = so,
+  assay = "macs3Peaks",
+  genome = BSgenome.Hsapiens.UCSC.hg38,
+  verbose = TRUE
+)
+
+so <- LinkPeaks(
+  object = so,
+  peak.assay = "macs3Peaks",
+  expression.assay = "SCT",
+  distance = 1e+06
+)
+
+```
+
+``` {r save_data}
+faster_saveRDS(
+  so@meta.data,
+  paste0(
+    figure_path(),
+    "metadata.rds"
+  )
+)
+
+faster_saveRDS(
+  so@reductions$ref.umap,
+  paste0(
+    figure_path(),
+    "CITE_seq_umap_reduction.rds"
+  )
+)
+
+faster_saveRDS(
+  so@reductions$umap.atac,
+  paste0(
+    figure_path(),
+    "atac_umap_reduction.rds"
+  )
+)
+
+faster_saveRDS(
+  so@reductions$umap.wnn,
+  paste0(
+    figure_path(),
+    "wnn_umap_reduction.rds"
+  )
+)
+
+faster_saveRDS(
+  so@reductions$umap.rna,
+  paste0(
+    figure_path(),
+    "rna_umap_reduction.rds"
+  )
+)
+
+faster_saveRDS(
+  so@commands,
+  paste0(
+    figure_path(),
+    "commands.rds"
+  )
+)
+
+faster_saveRDS(
+  macs2_peaks,
+  paste0(
+    figure_path(),
+    "macs2_peaks.rds"
+  )
+)
+
+faster_saveRDS(
+  so[['macs2Peaks']],
+  paste0(
+    figure_path(),
+    "macs2_peaks_assay.rds"
+  )
+)
+
+faster_saveRDS(
+  so@assays$ATAC,
+  paste0(
+    figure_path(),
+    "blood_peaks_ATAC_assay_w_links.rds"
+  )
+)
+
+faster_saveRDS(
+  so@assays$macs2Peaks,
+  paste0(
+    figure_path(),
+    "macs2_peaks_ATAC_assay_w_links.rds"
+  )
+)
+
+faster_saveRDS(
+  macs3_peaks,
+  paste0(
+    figure_path(),
+    "macs3_peaks.rds"
+  )
+)
+
+faster_saveRDS(
+  so@assays$macs3Peaks,
+  paste0(
+    figure_path(),
+    "macs3_peaks_assay_w_links.rds"
+  )
+)
+
+
+# do for merged_tp1
+faster_saveRDS(
+  so_tp1@meta.data,
+  paste0(
+    figure_path(),
+    "metadata_tp1.rds"
+  )
+)
+
+faster_saveRDS(
+  so_tp1@reductions$ref.umap,
+  paste0(
+    figure_path(),
+    "CITE_seq_umap_reduction_tp1.rds"
+  )
+)
+
+faster_saveRDS(
+  so_tp1@reductions$umap.atac,
+  paste0(
+    figure_path(),
+    "atac_umap_reduction_tp1.rds"
+  )
+)
+
+faster_saveRDS(
+  so_tp1@reductions$umap.wnn,
+  paste0(
+    figure_path(),
+    "wnn_umap_reduction_tp1.rds"
+  )
+)
+
+faster_saveRDS(
+  so_tp1@reductions$umap.rna,
+  paste0(
+    figure_path(),
+    "rna_umap_reduction_tp1.rds"
+  )
+)
+
+faster_saveRDS(
+  so_tp1@commands,
+  paste0(
+    figure_path(),
+    "commands_tp1.rds"
+  )
+)
+
+faster_saveRDS(
+  macs2_peaks_tp1,
+  paste0(
+    figure_path(),
+    "macs2_peaks_tp1.rds"
+  )
+)
+
+faster_saveRDS(
+  so_tp1[['macs2Peaks']],
+  paste0(
+    figure_path(),
+    "macs2_peaks_assay_tp1.rds"
+  )
+)
+
+faster_saveRDS(
+  so_tp1@assays$ATAC,
+  paste0(
+    figure_path(),
+    "blood_peaks_ATAC_assay_w_links_tp1.rds"
+  )
+)
+
+faster_saveRDS(
+  so_tp1@assays$macs2Peaks,
+  paste0(
+    figure_path(),
+    "macs2_peaks_ATAC_assay_w_links_tp1.rds"
+  )
+)
+
+# do for merged_tp2
+faster_saveRDS(
+  so_tp2@meta.data,
+  paste0(
+    figure_path(),
+    "metadata_tp2.rds"
+  )
+)
+
+faster_saveRDS(
+  so_tp2@reductions$ref.umap,
+  paste0(
+    figure_path(),
+    "CITE_seq_umap_reduction_tp2.rds"
+  )
+)
+
+faster_saveRDS(
+  so_tp2@reductions$umap.atac,
+  paste0(
+    figure_path(),
+    "atac_umap_reduction_tp2.rds"
+  )
+)
+
+faster_saveRDS(
+  so_tp2@reductions$umap.wnn,
+  paste0(
+    figure_path(),
+    "wnn_umap_reduction_tp2.rds"
+  )
+)
+
+faster_saveRDS(
+  so_tp2@reductions$umap.rna,
+  paste0(
+    figure_path(),
+    "rna_umap_reduction_tp2.rds"
+  )
+)
+
+faster_saveRDS(
+  so_tp2@commands,
+  paste0(
+    figure_path(),
+    "commands_tp2.rds"
+  )
+)
+
+faster_saveRDS(
+  macs2_peaks_tp2,
+  paste0(
+    figure_path(),
+    "macs2_peaks_tp2.rds"
+  )
+)
+
+faster_saveRDS(
+  so_tp2[['macs2Peaks']],
+  paste0(
+    figure_path(),
+    "macs2_peaks_assay_tp2.rds"
+  )
+)
+
+faster_saveRDS(
+  so_tp2@assays$ATAC,
+  paste0(
+    figure_path(),
+    "blood_peaks_ATAC_assay_w_links_tp2.rds"
+  )
+)
+
+faster_saveRDS(
+  so_tp2@assays$macs2Peaks,
+  paste0(
+    figure_path(),
+    "macs2_peaks_ATAC_assay_w_links_tp2.rds"
+  )
+)
+
+# do for merged_tp3
+faster_saveRDS(
+  so_tp3@meta.data,
+  paste0(
+    figure_path(),
+    "metadata_tp3.rds"
+  )
+)
+
+faster_saveRDS(
+  so_tp3@reductions$ref.umap,
+  paste0(
+    figure_path(),
+    "CITE_seq_umap_reduction_tp3.rds"
+  )
+)
+
+faster_saveRDS(
+  so_tp3@reductions$umap.atac,
+  paste0(
+    figure_path(),
+    "atac_umap_reduction_tp3.rds"
+  )
+)
+
+faster_saveRDS(
+  so_tp3@reductions$umap.wnn,
+  paste0(
+    figure_path(),
+    "wnn_umap_reduction_tp3.rds"
+  )
+)
+
+faster_saveRDS(
+  so_tp3@reductions$umap.rna,
+  paste0(
+    figure_path(),
+    "rna_umap_reduction_tp3.rds"
+  )
+)
+
+faster_saveRDS(
+  so_tp3@commands,
+  paste0(
+    figure_path(),
+    "commands_tp3.rds"
+  )
+)
+
+faster_saveRDS(
+  macs2_peaks_tp3,
+  paste0(
+    figure_path(),
+    "macs2_peaks_tp3.rds"
+  )
+)
+
+faster_saveRDS(
+  so_tp3[['macs2Peaks']],
+  paste0(
+    figure_path(),
+    "macs2_peaks_assay_tp3.rds"
+  )
+)
+
+faster_saveRDS(
+  so_tp3@assays$ATAC,
+  paste0(
+    figure_path(),
+    "blood_peaks_ATAC_assay_w_links_tp3.rds"
+  )
+)
+
+faster_saveRDS(
+  so_tp3@assays$macs2Peaks,
+  paste0(
+    figure_path(),
+    "macs2_peaks_ATAC_assay_w_links_tp3.rds"
+  )
+)
+```
